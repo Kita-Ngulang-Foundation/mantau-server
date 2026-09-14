@@ -1,0 +1,12 @@
+# mantau-core isn't published anywhere yet -- install from the local sibling
+# checkout (one level up now that this is a standalone repo under
+# mantau-prototype/, not nested under mantau-backend-localdevice/). Once it
+# has a remote and tests are green there, switch this to the pinned git SHA
+# documented in mantau-core's own README.
+-e ../mantau-core
+
+-e .
+
+# Dev / test
+pytest>=8.0
+pytest-asyncio>=0.23

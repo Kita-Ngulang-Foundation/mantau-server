@@ -1,0 +1,28 @@
+[project]
+name = "mantau-ld-server"
+version = "0.1.0"
+description = "Scenario 2 server: accepts signed envelopes from agents over an outbound tunnel, never dials in"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "aiosqlite>=0.20",
+    "httpx>=0.27",
+    # mantau-core is NOT listed here -- see README "Installing mantau-core".
+    # Not published anywhere yet; requirements.txt installs it from the
+    # local sibling checkout.
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

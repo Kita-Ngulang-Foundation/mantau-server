@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Runtime data / secrets
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*serviceAccount*.json
+*service-account*.json
+firebase-*.json
+.env
+.env.*
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
