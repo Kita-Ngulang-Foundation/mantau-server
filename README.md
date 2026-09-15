@@ -14,7 +14,7 @@ implements, and `../README.md` for how agent and server fit together.
 
 ## Install (local dev)
 
-Requires Python 3.10â€“3.12, and `mantau-core` checked out two levels up
+Requires Python 3.10–3.12, and `mantau-core` checked out two levels up
 (`../../mantau-core`) -- it isn't published anywhere yet.
 
 ```powershell
