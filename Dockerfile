@@ -12,7 +12,6 @@ RUN pip install --no-cache-dir \
  && pip install --no-cache-dir -e .
 
 ENV MANTAU_DB_PATH=/data/mantau_ld.db
-VOLUME ["/data"]
 
 EXPOSE 8100
 CMD ["uvicorn", "mantau_ld.main:app", "--host", "0.0.0.0", "--port", "8100"]
