@@ -14,4 +14,8 @@ RUN pip install --no-cache-dir \
 ENV MANTAU_DB_PATH=/data/mantau_ld.db
 
 EXPOSE 8100
-CMD ["uvicorn", "mantau_ld.main:app", "--host", "0.0.0.0", "--port", "8100"]
+# MANTAU_FCM_SERVICE_ACCOUNT_JSON (raw key content, set as a plain Railway
+# variable -- Railway has no MCP-automatable file-variable upload) is
+# materialized to disk on every boot; MANTAU_FCM_SERVICE_ACCOUNT_PATH then
+# just points at it. No-op when that var is unset (console-only alerts).
+CMD ["sh", "-c", "if [ -n \"$MANTAU_FCM_SERVICE_ACCOUNT_JSON\" ]; then printf '%s' \"$MANTAU_FCM_SERVICE_ACCOUNT_JSON\" > \"$MANTAU_FCM_SERVICE_ACCOUNT_PATH\"; fi; exec uvicorn mantau_ld.main:app --host 0.0.0.0 --port \"${PORT:-8100}\""]
