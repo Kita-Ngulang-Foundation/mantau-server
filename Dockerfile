@@ -1,16 +1,16 @@
-# Build context is the mantau-prototype/ PARENT directory (this repo's
-# sibling), e.g.: docker build -f Dockerfile -t mantau-server ..
-# Needs the mantau-core sibling package, which isn't published anywhere yet.
+# Standalone build: this repo alone is the build context (e.g. `docker
+# build -t mantau-server .`, or Railway's GitHub-connected build). Fetches
+# mantau-core from its own repo at a pinned commit instead of a local
+# sibling checkout -- see requirements.txt's note on this transition.
 FROM python:3.12-slim
 
 WORKDIR /app
-COPY mantau-core /app/mantau-core
-COPY mantau-server /app/server
+COPY . /app
 
-RUN pip install --no-cache-dir -e /app/mantau-core \
- && pip install --no-cache-dir -e /app/server
+RUN pip install --no-cache-dir \
+      "mantau-core[push] @ https://github.com/Kita-Ngulang-Foundation/mantau-core/archive/bfebdcc0419ba57982171b45b5375979991cb906.tar.gz" \
+ && pip install --no-cache-dir -e .
 
-WORKDIR /app/server
 ENV MANTAU_DB_PATH=/data/mantau_ld.db
 VOLUME ["/data"]
 
