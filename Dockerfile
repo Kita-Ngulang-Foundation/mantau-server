@@ -8,7 +8,7 @@ WORKDIR /app
 COPY . /app
 
 RUN pip install --no-cache-dir \
-      "mantau-core[push] @ https://github.com/Kita-Ngulang-Foundation/mantau-core/archive/bfebdcc0419ba57982171b45b5375979991cb906.tar.gz" \
+      "mantau-core[push] @ https://github.com/Kita-Ngulang-Foundation/mantau-core/archive/75111dd24f03324a60cf4a06ae9218defbc0595a.tar.gz" \
  && pip install --no-cache-dir -e .
 
 ENV MANTAU_DB_PATH=/data/mantau_ld.db
