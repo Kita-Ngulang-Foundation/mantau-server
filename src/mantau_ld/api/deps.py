@@ -9,6 +9,7 @@ from mantau_core.notify.delivery import AckService
 
 from ..alerts.dispatcher import AlertDispatcher
 from ..config import Settings
+from ..frames import FrameStore
 from ..heartbeats import HeartbeatTracker
 from ..store.agents_repo import AgentsRepo
 from ..store.cameras_repo import CamerasRepo
@@ -56,3 +57,7 @@ def get_ack_service(request: Request) -> AckService:
 
 def get_heartbeats(request: Request) -> HeartbeatTracker:
     return request.app.state.heartbeats
+
+
+def get_frames(request: Request) -> FrameStore:
+    return request.app.state.frames

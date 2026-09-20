@@ -22,6 +22,7 @@ from mantau_core.notify.delivery import AckService, DeliveryTracker
 
 from ..alerts.dispatcher import AlertDispatcher
 from ..config import Settings
+from ..frames import FrameStore
 from ..heartbeats import HeartbeatTracker
 from ..store.agents_repo import AgentsRepo
 from ..store.cameras_repo import CamerasRepo
@@ -30,7 +31,7 @@ from ..store.events_repo import EventsRepo
 from ..store.recipient_resolver import SqliteRecipientResolver
 from ..store.sync_db import SyncDatabase
 from ..store.token_store import SqliteTokenStore
-from .routes import agents, cameras, contacts, devices, events, health, ingest
+from .routes import agents, cameras, contacts, devices, events, frames, health, ingest
 
 
 def _build_channels(
@@ -83,6 +84,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.dispatcher = dispatcher
         app.state.ack_service = AckService()
         app.state.heartbeats = HeartbeatTracker()
+        app.state.frames = FrameStore()
 
         yield
 
@@ -100,4 +102,5 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(events.router)
     app.include_router(devices.router)
     app.include_router(contacts.router)
+    app.include_router(frames.router)
     return app
