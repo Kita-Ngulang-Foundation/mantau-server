@@ -52,6 +52,11 @@ the inherited ones -- push/Telegram credentials, backoff defaults):
 |---|---|---|
 | `MANTAU_DB_PATH` | `data/mantau_ld.db` | SQLite file. `:memory:` supported via shared-cache mode (see `store/db.py`). |
 | `MANTAU_TELEGRAM_CHAT_IDS` | `""` | Comma-separated. TEMPORARY, see `mantau_core.notify.channels.telegram`. |
+| `MANTAU_CONTROL_PLANE_MODE` | `disabled` | `disabled`, explicit `local_dev`, or `production`. |
+| `MANTAU_CONTROL_PLANE_AUTH_TOKENS_JSON` | `{}` | Production bearer-token to account-id map. Production fails closed when empty/invalid. |
+| `MANTAU_CONTROL_PLANE_ENCRYPTION_KEY` | empty | Required Fernet key for camera test/config commands. Keep stable across restarts and rotate operationally only after credential commands drain. |
+| `MANTAU_COMMAND_TTL_S` | `300` | Command expiry window. |
+| `MANTAU_COMMAND_DELIVERY_LEASE_S` | `30` | Re-delivery delay when an agent does not acknowledge a delivered command. |
 
 ## API
 
@@ -68,13 +73,44 @@ the inherited ones -- push/Telegram credentials, backoff defaults):
 | `POST /devices/register`, `DELETE /devices/{token}` | Push token lifecycle. |
 | `POST/GET/DELETE /contacts[/{id}]` | Emergency-contact CRUD (see "Known gaps"). |
 
+## Additive control plane
+
+Enrollment still returns the one-time agent secret and now also returns a claim
+code. The app authenticates, exchanges that code at `POST /agent-claims`, and
+can then see or control only agents owned by its account. In `local_dev` mode
+the explicit development identity is `X-Mantau-User-ID`; in `production` use
+`Authorization: Bearer ...` with the configured token map. Control endpoints
+never fall back to anonymous production access.
+
+App routes are `GET /agents`, `GET /agents/{id}/setup`, discovery command/result,
+camera test/configuration, inference-mode update, restart, and reconfigure.
+Every command-creating request requires `Idempotency-Key`. Agents authenticate
+with their existing enrolled id/secret at
+`POST /agent-control/commands/poll` and submit structured state/results at
+`POST /agent-control/commands/{id}/results`.
+
+Commands persist as `queued -> delivered -> running -> succeeded|failed`, or
+`expired`. A lost delivery is leased and re-queued; an offline agent receives
+unexpired work when it returns. Camera username/password fields are encrypted
+with Fernet in a separate short-lived blob, never copied into metadata or
+results, and the blob is deleted on the first running/final acknowledgement.
+Database/log backups still contain the enrollment HMAC secret from the legacy
+design, so protect them accordingly.
+
+Rollout is expand-only: leave `MANTAU_CONTROL_PLANE_MODE=disabled` while old
+servers/agents coexist, deploy the schema/server, then opt new agents into
+polling. Old agents keep using `/ingest`, heartbeats, frames, and events; queued
+commands are simply unused. Rollback means disabling the control plane and
+turning off agent polling. Keep the additive tables and columns in place; no
+down migration or data deletion is required.
+
 ## Test
 
 ```powershell
 .venv\Scripts\python.exe -m pytest tests/ -q
 ```
 
-29 tests, all offline: real HMAC signing/verification (not stubbed crypto),
+46 tests, all offline: real HMAC signing/verification (not stubbed crypto),
 real SQLite round-trips including the dedupe ledger's uniqueness constraint,
 and a real ASGI `TestClient` exercising the full ingest -> dispatch -> event
 path together.
@@ -91,8 +127,9 @@ path together.
   strict per-agent sequence. See that module's docstring for what a reorder
   buffer would need.
 - **No clip generation.**
-- **Single-account data model** -- one flat device list, one flat contact
-  list, no household/multi-user concept, matching the app exactly.
+- **Contacts and push devices remain account-global.** Agent control is
+  owner-scoped, but those older subsystems have not been migrated in this
+  additive stage.
 - **Agent secrets are stored in plain SQLite columns**, same simplification
   as mantau-backend-rtsp's camera passwords.
 - **Docker Compose is unverified end-to-end** (`../docker/compose.yaml`) --

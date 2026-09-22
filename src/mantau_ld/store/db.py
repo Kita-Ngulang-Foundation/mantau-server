@@ -66,6 +66,75 @@ CREATE TABLE IF NOT EXISTS ingested_envelopes (
     received_at  REAL NOT NULL,
     PRIMARY KEY (agent_id, seq)
 );
+
+CREATE TABLE IF NOT EXISTS claim_codes (
+    code        TEXT PRIMARY KEY,
+    agent_id    TEXT NOT NULL,
+    created_at  REAL NOT NULL,
+    expires_at  REAL NOT NULL,
+    claimed_at  REAL,
+    FOREIGN KEY (agent_id) REFERENCES agents(agent_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS agent_ownership (
+    agent_id    TEXT PRIMARY KEY,
+    owner_id    TEXT NOT NULL,
+    claimed_at  REAL NOT NULL,
+    FOREIGN KEY (agent_id) REFERENCES agents(agent_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS agent_control_state (
+    agent_id                    TEXT PRIMARY KEY,
+    platform                    TEXT,
+    capabilities_json           TEXT,
+    setup_status                TEXT NOT NULL DEFAULT 'not_started',
+    health_state                TEXT NOT NULL DEFAULT 'offline',
+    requested_inference_mode    TEXT,
+    effective_inference_mode    TEXT,
+    camera_connectivity         TEXT NOT NULL DEFAULT 'unknown',
+    health_explanation          TEXT,
+    updated_at                  REAL NOT NULL,
+    FOREIGN KEY (agent_id) REFERENCES agents(agent_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS queued_commands (
+    command_id          TEXT PRIMARY KEY,
+    agent_id            TEXT NOT NULL,
+    owner_id            TEXT NOT NULL,
+    command_type        TEXT NOT NULL,
+    state               TEXT NOT NULL,
+    payload_json        TEXT NOT NULL,
+    encrypted_payload   BLOB,
+    idempotency_key     TEXT NOT NULL,
+    created_at          REAL NOT NULL,
+    expires_at          REAL NOT NULL,
+    delivered_at        REAL,
+    completed_at        REAL,
+    UNIQUE(owner_id, agent_id, idempotency_key),
+    FOREIGN KEY (agent_id) REFERENCES agents(agent_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS command_results (
+    command_id       TEXT PRIMARY KEY,
+    state            TEXT NOT NULL,
+    failure_reason   TEXT,
+    message          TEXT,
+    data_json        TEXT NOT NULL,
+    completed_at     REAL,
+    FOREIGN KEY (command_id) REFERENCES queued_commands(command_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS discovery_results (
+    agent_id       TEXT NOT NULL,
+    command_id     TEXT NOT NULL,
+    result_json    TEXT NOT NULL,
+    discovered_at REAL NOT NULL,
+    PRIMARY KEY (agent_id, command_id),
+    FOREIGN KEY (agent_id) REFERENCES agents(agent_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_commands_agent_state
+ON queued_commands(agent_id, state, created_at);
 """
 
 

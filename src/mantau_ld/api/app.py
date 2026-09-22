@@ -26,12 +26,13 @@ from ..frames import FrameStore
 from ..heartbeats import HeartbeatTracker
 from ..store.agents_repo import AgentsRepo
 from ..store.cameras_repo import CamerasRepo
+from ..store.control_repo import ControlRepo
 from ..store.db import Database
 from ..store.events_repo import EventsRepo
 from ..store.recipient_resolver import SqliteRecipientResolver
 from ..store.sync_db import SyncDatabase
 from ..store.token_store import SqliteTokenStore
-from .routes import agents, cameras, contacts, devices, events, frames, health, ingest
+from .routes import agents, cameras, contacts, control, devices, events, frames, health, ingest
 
 
 def _build_channels(
@@ -65,6 +66,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         sync_db = SyncDatabase(settings.db_path)
 
         agents_repo = AgentsRepo(db)
+        control_repo = ControlRepo(db)
         cameras_repo = CamerasRepo(db)
         events_repo = EventsRepo(db)
         token_store = SqliteTokenStore(sync_db)
@@ -77,6 +79,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.db = db
         app.state.sync_db = sync_db
         app.state.agents_repo = agents_repo
+        app.state.control_repo = control_repo
         app.state.cameras_repo = cameras_repo
         app.state.events_repo = events_repo
         app.state.token_store = token_store
@@ -98,6 +101,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(health.router)
     app.include_router(ingest.router)
     app.include_router(agents.router)
+    app.include_router(control.router)
     app.include_router(cameras.router)
     app.include_router(events.router)
     app.include_router(devices.router)

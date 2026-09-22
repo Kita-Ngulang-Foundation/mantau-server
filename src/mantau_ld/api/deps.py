@@ -13,6 +13,7 @@ from ..frames import FrameStore
 from ..heartbeats import HeartbeatTracker
 from ..store.agents_repo import AgentsRepo
 from ..store.cameras_repo import CamerasRepo
+from ..store.control_repo import ControlRepo
 from ..store.db import Database
 from ..store.events_repo import EventsRepo
 from ..store.recipient_resolver import SqliteRecipientResolver
@@ -33,6 +34,10 @@ def get_agents_repo(request: Request) -> AgentsRepo:
 
 def get_cameras_repo(request: Request) -> CamerasRepo:
     return request.app.state.cameras_repo
+
+
+def get_control_repo(request: Request) -> ControlRepo:
+    return request.app.state.control_repo
 
 
 def get_events_repo(request: Request) -> EventsRepo:
