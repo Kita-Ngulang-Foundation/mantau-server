@@ -41,11 +41,18 @@ class EventRecord:
     reviewed_at: float | None
     reviewed_by: str | None
     has_recording: bool
+    # Latest server-inference confirmation (HYBRID) from the event's own agent.
+    server_confirmed: bool | None = None
+    server_confirmation_confidence: float | None = None
 
 
 _RECORD_SQL = (
     "SELECT e.*, c.name AS camera_name, "
-    "EXISTS(SELECT 1 FROM recordings r WHERE r.event_id=e.event_id) AS has_recording "
+    "EXISTS(SELECT 1 FROM recordings r WHERE r.event_id=e.event_id) AS has_recording, "
+    "(SELECT ic.confirmed FROM inference_confirmations ic WHERE ic.event_id=e.event_id "
+    " AND ic.agent_id=e.agent_id ORDER BY ic.created_at DESC LIMIT 1) AS server_confirmed, "
+    "(SELECT ic.confidence FROM inference_confirmations ic WHERE ic.event_id=e.event_id "
+    " AND ic.agent_id=e.agent_id ORDER BY ic.created_at DESC LIMIT 1) AS server_confidence "
     "FROM events e LEFT JOIN cameras c ON c.camera_id=e.camera_id "
 )
 
@@ -57,6 +64,9 @@ def _row_to_record(row: aiosqlite.Row) -> EventRecord:
         acknowledged_at=row["acknowledged_at"], acknowledged_by=row["acknowledged_by"],
         reviewed_at=row["reviewed_at"], reviewed_by=row["reviewed_by"],
         has_recording=bool(row["has_recording"]),
+        server_confirmed=(None if row["server_confirmed"] is None
+                          else bool(row["server_confirmed"])),
+        server_confirmation_confidence=row["server_confidence"],
     )
 
 

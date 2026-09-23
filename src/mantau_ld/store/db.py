@@ -122,6 +122,18 @@ CREATE TABLE IF NOT EXISTS events (
     FOREIGN KEY (camera_id) REFERENCES cameras(camera_id)
 );
 
+CREATE TABLE IF NOT EXISTS inference_confirmations (
+    event_id      TEXT NOT NULL,
+    frame_id      TEXT NOT NULL,
+    agent_id      TEXT NOT NULL,
+    household_id  TEXT NOT NULL,
+    confirmed     INTEGER NOT NULL,
+    confidence    REAL NOT NULL,
+    reason        TEXT,
+    created_at    REAL NOT NULL,
+    PRIMARY KEY (event_id, frame_id)
+);
+
 CREATE TABLE IF NOT EXISTS device_tokens (
     device_id      TEXT PRIMARY KEY,
     user_id        TEXT,

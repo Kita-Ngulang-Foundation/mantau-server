@@ -36,6 +36,20 @@ class Settings(CoreSettings):
     recording_max_bytes: int = 20 * 1024 * 1024
     recording_retention_days: int = 30
     frame_max_bytes: int = 2 * 1024 * 1024
+
+    # Server inference (POST /agents/{id}/inference): agents without a usable
+    # on-device detector upload sampled frames and this server runs the same
+    # detector. Frames are processed in memory and never stored.
+    inference_enabled: bool = True
+    inference_max_frame_bytes: int = 512 * 1024
+    inference_max_frame_age_s: float = 10.0
+    inference_max_clock_skew_s: float = 5.0
+    inference_max_fps: float = 15.0
+    inference_session_idle_s: float = 120.0
+    inference_max_sessions: int = 8
+    inference_workers: int = 2
+    inference_idempotency_ttl_s: float = 300.0
+    inference_result_retention_days: int = 30
     invite_attempt_limit: int = 10
     invite_attempt_window_s: int = 3600
 

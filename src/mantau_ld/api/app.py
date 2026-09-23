@@ -24,6 +24,7 @@ from ..alerts.dispatcher import AlertDispatcher
 from ..config import Settings
 from ..frames import FrameStore
 from ..heartbeats import HeartbeatTracker
+from ..inference.service import DetectorFactory, FrameDecoder, InferenceService
 from ..oidc_auth import OidcAuthenticator
 from ..store.agents_repo import AgentsRepo
 from ..store.cameras_repo import CamerasRepo
@@ -33,6 +34,7 @@ from ..store.detection_settings_repo import DetectionSettingsRepo
 from ..store.recordings_repo import RecordingsRepo
 from ..store.events_repo import EventsRepo
 from ..store.identity_repo import IdentityRepo
+from ..store.inference_repo import InferenceRepo
 from ..store.recipient_resolver import SqliteRecipientResolver
 from ..store.sync_db import SyncDatabase
 from ..store.token_store import SqliteTokenStore
@@ -43,7 +45,7 @@ logging.getLogger("aiosqlite").setLevel(logging.INFO)
 
 from .routes import (  # noqa: E402
     agents, cameras, contacts, control, detection, devices, events, frames, health, households,
-    ingest, recordings,
+    inference, ingest, recordings,
 )
 
 
@@ -73,7 +75,12 @@ def create_app(
     settings: Settings | None = None,
     *,
     oidc_authenticator: OidcAuthenticator | None = None,
+    inference_factory: DetectorFactory | None = None,
+    inference_decoder: FrameDecoder | None = None,
 ) -> FastAPI:
+    """`inference_factory`/`inference_decoder` replace the MediaPipe detector
+    and JPEG decoder (tests); by default the real ones are used when the
+    `detection` extra is installed, and inference reports unavailable if not."""
     settings = settings or Settings()
     oidc_authenticator = oidc_authenticator or OidcAuthenticator(
         issuer=settings.oidc_issuer,
@@ -122,10 +129,16 @@ def create_app(
         app.state.detection_settings_repo = DetectionSettingsRepo(db)
         app.state.recordings_repo = RecordingsRepo(db, settings.recordings_dir)
         await app.state.recordings_repo.prune(settings.recording_retention_days)
+        app.state.inference_repo = InferenceRepo(db)
+        await app.state.inference_repo.prune(settings.inference_result_retention_days)
+        app.state.inference = InferenceService(
+            settings, factory=inference_factory, decoder=inference_decoder)
+        await app.state.inference.start()
 
         try:
             yield
         finally:
+            await app.state.inference.close()
             await db.close()
             sync_db.close()
 
@@ -164,4 +177,5 @@ def create_app(
     app.include_router(frames.router)
     app.include_router(detection.router)
     app.include_router(recordings.router)
+    app.include_router(inference.router)
     return app

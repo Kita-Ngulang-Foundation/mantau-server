@@ -43,6 +43,9 @@ class EventOut(BaseModel):
     reviewed_at: datetime | None = None
     reviewed_by: str | None = None
     has_recording: bool = False
+    # HYBRID: did server inference also see someone lying down? None = not asked.
+    server_confirmed: bool | None = None
+    server_confirmation_confidence: float | None = None
 
     @classmethod
     def from_record(cls, record: EventRecord) -> "EventOut":
@@ -56,6 +59,8 @@ class EventOut(BaseModel):
             acknowledged_at=_ts(record.acknowledged_at), acknowledged_by=record.acknowledged_by,
             reviewed_at=_ts(record.reviewed_at), reviewed_by=record.reviewed_by,
             has_recording=record.has_recording,
+            server_confirmed=record.server_confirmed,
+            server_confirmation_confidence=record.server_confirmation_confidence,
         )
 
 

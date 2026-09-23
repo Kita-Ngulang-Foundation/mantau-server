@@ -78,6 +78,14 @@ the inherited ones -- push/Telegram credentials, backoff defaults):
 | `MANTAU_RECORDING_RETENTION_DAYS` | `30` | Older clips are deleted. |
 | `MANTAU_RECORDING_MAX_BYTES` / `MANTAU_FRAME_MAX_BYTES` | 20 MB / 2 MB | Upload limits (413 above them). |
 | `MANTAU_HOUSEHOLD_INVITE_TTL_S` | `172800` | Invite code lifetime. |
+| `MANTAU_INFERENCE_ENABLED` | `true` | Server inference for agents without a usable on-device detector. Needs mantau-AI (`mantau-core[detection]`); otherwise reported unavailable. |
+| `MANTAU_INFERENCE_MAX_FRAME_BYTES` | `524288` | Per-frame upload limit (413 above it). |
+| `MANTAU_INFERENCE_MAX_FRAME_AGE_S` / `MANTAU_INFERENCE_MAX_CLOCK_SKEW_S` | `10` / `5` | Frames captured longer ago, or further in the future, are refused (422). |
+| `MANTAU_INFERENCE_MAX_FPS` | `15` | Advertised per-stream rate; a stream sending faster than twice that is refused (429). |
+| `MANTAU_INFERENCE_MAX_SESSIONS` / `MANTAU_INFERENCE_SESSION_IDLE_S` | `8` / `120` | Concurrent detector sessions (each holds a pose model; 503 when full) and when an idle one is closed. |
+| `MANTAU_INFERENCE_WORKERS` | `2` | Frames run through the detector at the same time. |
+| `MANTAU_INFERENCE_IDEMPOTENCY_TTL_S` | `300` | How long an answered frame id is replayed instead of re-run. |
+| `MANTAU_INFERENCE_RESULT_RETENTION_DAYS` | `30` | HYBRID confirmation results are deleted after this. Frames are never stored. |
 | `MANTAU_API_DOCS_ENABLED` | `false` | Serve `/docs`, `/redoc`, `/openapi.json` in production. Always on in `local_dev`. |
 
 ## API
@@ -99,6 +107,8 @@ the inherited ones -- push/Telegram credentials, backoff defaults):
 | `GET/PUT /cameras/{id}/detection-settings` | Zones, per-feature thresholds, night window, timezone. Members read; owners/admins write. Each change is a new version delivered to the agent (`apply_detection_settings`); `applied_version` shows what the agent runs. |
 | `POST /events/{id}/recording` | Agent-signed MP4 clip upload for its own event (`HMAC(secret, "<event_id>." + body)`). Refused for bathroom-duration events. Size-limited. |
 | `GET /events/{id}/recording` | Clip download for household members. |
+| `GET /inference/capability` | Whether this server runs the fall detector, with its frame limits. No tenant data; agents read it at startup. |
+| `POST /agents/{id}/inference` | Agent-signed JPEG frame (`mantau_core.contracts.inference`: HMAC over a versioned message covering every header and the body). The server runs the same detector as the agents in one session per agent+camera+session id. Falls it detects are stored and pushed like ingested events and returned; frames with `X-Mantau-Event-Ids` are HYBRID confirmations, stored against that agent's own events (`server_confirmed` on `GET /events/{id}`). Retries with the same frame id return the first answer. Frames are never stored. |
 | `POST /devices/register`, `DELETE /devices/{device_id}` | Household-owned push token lifecycle; raw tokens never appear in URLs. |
 | `POST/GET/PUT/DELETE /contacts[/{id}]`, `PUT /contacts/order` | Emergency contacts (max 10, validated phone numbers); order decides who is called first. |
 

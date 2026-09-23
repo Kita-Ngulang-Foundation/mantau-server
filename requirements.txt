@@ -4,6 +4,9 @@
 # has a remote and tests are green there, switch this to the pinned git SHA
 # documented in mantau-core's own README.
 -e ../mantau-core
+# Server inference (POST /agents/{id}/inference) runs the same detector as the
+# agents; without it the server runs and reports inference unavailable.
+-e ../mantau-AI
 
 -e .
 
