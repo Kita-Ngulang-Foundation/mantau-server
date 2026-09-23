@@ -26,3 +26,6 @@ firebase-*.json
 .idea/
 .DS_Store
 Thumbs.db
+
+# CI checkout of mantau-core
+.deps/

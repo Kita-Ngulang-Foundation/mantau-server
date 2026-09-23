@@ -14,8 +14,8 @@ implements, and `../README.md` for how agent and server fit together.
 
 ## Install (local dev)
 
-Requires Python 3.10–3.12, and `mantau-core` checked out two levels up
-(`../../mantau-core`) -- it isn't published anywhere yet.
+Requires Python 3.10–3.12, and `mantau-core` checked out one level up
+(`../mantau-core`) -- it isn't published anywhere yet.
 
 ```powershell
 py -3.12 -m venv .venv
@@ -25,6 +25,7 @@ py -3.12 -m venv .venv
 ## Run
 
 ```powershell
+$env:MANTAU_CONTROL_PLANE_MODE = "local_dev"
 .venv\Scripts\python.exe -m uvicorn mantau_ld.main:app --port 8100 --reload
 ```
 
@@ -32,16 +33,23 @@ py -3.12 -m venv .venv
 # enroll an agent -- do this once, before it can send anything
 curl -X POST http://localhost:8100/agents/enroll -H "Content-Type: application/json" `
   -d '{"agent_id": "agent-1"}'
-# -> {"agent_id": "agent-1", "secret": "..."}  -- copy this into the agent's config
+# -> {"agent_id": "agent-1", "secret": "...", "claim_code": "..."}
+
+# claim it before it can ingest or own cameras
+curl -X POST http://localhost:8100/agent-claims -H "Content-Type: application/json" `
+  -H "X-Mantau-User-ID: local-user" `
+  -d '{"claim_code": "...", "platform": "linux"}'
 
 curl -X POST http://localhost:8100/cameras -H "Content-Type: application/json" `
+  -H "X-Mantau-User-ID: local-user" `
   -d '{"camera_id": "cam-1", "name": "Kamar Ibu", "agent_id": "agent-1"}'
 
 curl http://localhost:8100/ready
 ```
 
-With no `MANTAU_FCM_*`/`MANTAU_TELEGRAM_*` configured, alerts print to
-stdout via a console channel.
+In explicit `local_dev` mode, alerts fall back to the console when no push or
+Telegram channel is configured. Production never uses global Telegram or
+console recipients.
 
 ## Configuration
 
@@ -52,35 +60,68 @@ the inherited ones -- push/Telegram credentials, backoff defaults):
 |---|---|---|
 | `MANTAU_DB_PATH` | `data/mantau_ld.db` | SQLite file. `:memory:` supported via shared-cache mode (see `store/db.py`). |
 | `MANTAU_TELEGRAM_CHAT_IDS` | `""` | Comma-separated. TEMPORARY, see `mantau_core.notify.channels.telegram`. |
-| `MANTAU_CONTROL_PLANE_MODE` | `disabled` | `disabled`, explicit `local_dev`, or `production`. |
-| `MANTAU_CONTROL_PLANE_AUTH_TOKENS_JSON` | `{}` | Production bearer-token to account-id map. Production fails closed when empty/invalid. |
+| `MANTAU_CONTROL_PLANE_MODE` | `production` | `production` validates OIDC; `local_dev` explicitly enables `X-Mantau-User-ID`; `disabled` fails closed. |
+| `MANTAU_OIDC_ISSUER` | empty | Exact trusted JWT issuer. Required in production. |
+| `MANTAU_OIDC_AUDIENCE` | empty | Required JWT audience. Required in production. |
+| `MANTAU_OIDC_JWKS_URL` | empty | HTTPS JWKS endpoint used for signature-key lookup. Required in production. |
+| `MANTAU_OIDC_ALGORITHMS` | `RS256` | Comma-separated JWT signature algorithms accepted from the configured issuer. |
+| `MANTAU_OIDC_LEEWAY_S` | `30` | Clock-skew allowance for JWT time validation. |
+| `MANTAU_CONTROL_PLANE_AUTH_TOKENS_JSON` | `{}` | Deprecated and ignored; static bearer-token maps are not production authentication. |
 | `MANTAU_CONTROL_PLANE_ENCRYPTION_KEY` | empty | Required Fernet key for camera test/config commands. Keep stable across restarts and rotate operationally only after credential commands drain. |
 | `MANTAU_COMMAND_TTL_S` | `300` | Command expiry window. |
 | `MANTAU_COMMAND_DELIVERY_LEASE_S` | `30` | Re-delivery delay when an agent does not acknowledge a delivered command. |
+| `MANTAU_CLAIM_CODE_TTL_S` | `600` | Lifetime of a hashed, single-use enrollment claim. |
+| `MANTAU_CLAIM_ATTEMPT_LIMIT` | `5` | Claim attempts allowed per user in one rate window. |
+| `MANTAU_CLAIM_ATTEMPT_WINDOW_S` | `60` | Claim rate-limit window. |
+| `MANTAU_CORS_ORIGINS` | empty | Comma-separated browser origins. Empty disables CORS (the mobile app and agents do not need it). |
+| `MANTAU_API_DOCS_ENABLED` | `false` | Serve `/docs`, `/redoc`, `/openapi.json` in production. Always on in `local_dev`. |
 
 ## API
 
 | Route | What |
 |---|---|
-| `GET /health`, `GET /ready` | Liveness, and per-agent status from its last heartbeat. |
-| `POST /agents/enroll` | Issue a new HMAC secret for an agent id. Shown once. |
+| `GET /health`, `GET /ready` | Liveness; readiness answers 503 with the *names* of missing production settings (OIDC, Fernet key, FCM) or an unreachable database. Use `/ready` as the deploy health check. Per-agent heartbeats only in `local_dev`. |
+| `POST /agent-control/claim-code` | Agent-authenticated. Fresh single-use claim code for an unclaimed agent; 409 once claimed. Never rotates the secret. |
+| `POST /agents/enroll` | Create-only initial enrollment (existing id without proof: 409 `agent_id_taken`), or secret rotation with `X-Mantau-Agent-ID`/`-Secret` proof. Secret shown once. |
 | `GET /agents`, `DELETE /agents/{id}` | List enrolled agents; revoke one (its envelopes fail verification from then on). |
 | `POST /ingest` | The one endpoint an agent calls. See `../protocol/PROTOCOL.md`. |
 | `POST/GET/DELETE /cameras[/{id}]` | Register a camera's display name (this server holds no RTSP URL or credentials -- the agent owns those). |
 | `GET /events`, `GET /events/{id}` | List / inspect events. |
 | `POST /events/{id}/ack` | A device saw the alert -- closes the latency trace's ACKED stage. |
 | `POST /events/{id}/status` | Human triage: `needs_review` / `dismissed` / `confirmed`. |
-| `POST /devices/register`, `DELETE /devices/{token}` | Push token lifecycle. |
+| `GET /households` | The signed-in user's households (`household_id`, `name`, `role`). The only user route that needs no household selection. |
+| `POST /devices/register`, `DELETE /devices/{device_id}` | Household-owned push token lifecycle; raw tokens never appear in URLs. |
 | `POST/GET/DELETE /contacts[/{id}]` | Emergency-contact CRUD (see "Known gaps"). |
+
+## Firebase Authentication
+
+The Mantau app signs users in with Firebase Authentication (project
+`mantau-fce89`). Firebase ID tokens are RS256 JWTs, so the OIDC validator
+accepts them with configuration only:
+
+```sh
+MANTAU_CONTROL_PLANE_MODE=production
+MANTAU_OIDC_ISSUER=https://securetoken.google.com/mantau-fce89
+MANTAU_OIDC_AUDIENCE=mantau-fce89
+MANTAU_OIDC_JWKS_URL=https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com
+MANTAU_OIDC_ALGORITHMS=RS256
+```
+
+Users are keyed by `(issuer, sub)`, where `sub` is the Firebase UID. A first
+sign-in creates the user and a household they own. A user with several
+memberships must send `X-Mantau-Household-ID` (one of the ids from
+`GET /households`); without it, household-scoped routes answer
+`400 household_required`.
 
 ## Additive control plane
 
 Enrollment still returns the one-time agent secret and now also returns a claim
-code. The app authenticates, exchanges that code at `POST /agent-claims`, and
-can then see or control only agents owned by its account. In `local_dev` mode
-the explicit development identity is `X-Mantau-User-ID`; in `production` use
-`Authorization: Bearer ...` with the configured token map. Control endpoints
-never fall back to anonymous production access.
+code. The app authenticates, exchanges that short-lived single-use code at
+`POST /agent-claims`, and can then see or control only agents owned by its
+household. In `local_dev` mode the explicit development identity is
+`X-Mantau-User-ID`; in production, `Authorization: Bearer ...` is validated
+against the configured issuer, audience, JWKS signature keys, and expiry.
+Missing production OIDC configuration fails closed.
 
 App routes are `GET /agents`, `GET /agents/{id}/setup`, discovery command/result,
 camera test/configuration, inference-mode update, restart, and reconfigure.
@@ -97,12 +138,11 @@ results, and the blob is deleted on the first running/final acknowledgement.
 Database/log backups still contain the enrollment HMAC secret from the legacy
 design, so protect them accordingly.
 
-Rollout is expand-only: leave `MANTAU_CONTROL_PLANE_MODE=disabled` while old
-servers/agents coexist, deploy the schema/server, then opt new agents into
-polling. Old agents keep using `/ingest`, heartbeats, frames, and events; queued
-commands are simply unused. Rollback means disabling the control plane and
-turning off agent polling. Keep the additive tables and columns in place; no
-down migration or data deletion is required.
+Rollout is expand-only: deploy the additive schema before enabling production
+traffic, configure OIDC, then opt new agents into polling. Use `local_dev` only
+for explicit legacy testing. Rollback means disabling user traffic and agent
+polling while keeping the additive tables and columns; no down migration or
+data deletion is required.
 
 ## Test
 
@@ -110,10 +150,10 @@ down migration or data deletion is required.
 .venv\Scripts\python.exe -m pytest tests/ -q
 ```
 
-46 tests, all offline: real HMAC signing/verification (not stubbed crypto),
+56 tests, all offline: real JWT and HMAC signing/verification,
 real SQLite round-trips including the dedupe ledger's uniqueness constraint,
-and a real ASGI `TestClient` exercising the full ingest -> dispatch -> event
-path together.
+cross-household denial and migration coverage, and a real ASGI `TestClient`
+exercising the full ingest -> dispatch -> event path together.
 
 ## Known gaps
 
@@ -127,10 +167,16 @@ path together.
   strict per-agent sequence. See that module's docstring for what a reorder
   buffer would need.
 - **No clip generation.**
-- **Contacts and push devices remain account-global.** Agent control is
-  owner-scoped, but those older subsystems have not been migrated in this
-  additive stage.
 - **Agent secrets are stored in plain SQLite columns**, same simplification
   as mantau-backend-rtsp's camera passwords.
 - **Docker Compose is unverified end-to-end** (`../docker/compose.yaml`) --
   run it against a live Docker engine before a demo depends on it.
+
+
+## Deploying
+
+`mantau-core.ref` pins the mantau-core commit for both the Docker image and
+CI. Bump it only to a commit that is pushed to
+`Kita-Ngulang-Foundation/mantau-core`. Point the platform health check at
+`/ready`: a deploy missing OIDC, the Fernet key, or FCM settings stays
+unhealthy instead of silently serving.

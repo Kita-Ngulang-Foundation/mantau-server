@@ -1,0 +1,28 @@
+name: Test
+
+on:
+  push:
+    branches: [main, final_product]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The same mantau-core commit the Docker image installs (mantau-core.ref).
+      - name: Read pinned mantau-core commit
+        id: core
+        run: echo "ref=$(tr -d '[:space:]' < mantau-core.ref)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: Kita-Ngulang-Foundation/mantau-core
+          ref: ${{ steps.core.outputs.ref }}
+          path: .deps/mantau-core
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: |
+          pip install -e ".deps/mantau-core[push]"
+          pip install -e . pytest pytest-asyncio
+      - run: pytest -q

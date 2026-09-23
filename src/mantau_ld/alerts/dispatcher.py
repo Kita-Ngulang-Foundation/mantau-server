@@ -30,14 +30,14 @@ class AlertDispatcher:
         # choice for AckService and mantau-backend-rtsp's dispatcher.
         self.traces: dict[str, LatencyTrace] = {}
 
-    async def dispatch(self, event: FallEvent) -> None:
+    async def dispatch(self, event: FallEvent, *, household_id: str, agent_id: str) -> None:
         trace = LatencyTrace(event.event_id)
         trace.stamp(Stage.CAPTURED, at=event.occurred_at.timestamp())
         trace.stamp(Stage.DETECTED, at=event.occurred_at.timestamp())
         self.traces[event.event_id] = trace
 
-        await self.events_repo.insert(event)
-        camera_name = await self.cameras_repo.name_for(event.camera_id)
+        await self.events_repo.insert(event, household_id=household_id, agent_id=agent_id)
+        camera_name = await self.cameras_repo.name_for(event.camera_id, household_id)
         await self.fanout.send(event, camera_name=camera_name, trace=trace)
 
     def get_trace(self, event_id: str) -> LatencyTrace | None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import secrets
 import time
 import uuid
@@ -28,80 +29,121 @@ class IdempotencyConflict(ValueError):
     pass
 
 
+class ClaimRateLimited(PermissionError):
+    pass
+
+
 class ControlRepo:
     def __init__(self, db: Database) -> None:
         self._db = db
 
-    async def create_claim_code(self, agent_id: str, *, ttl_s: int = 86400) -> str:
-        code = secrets.token_urlsafe(8).replace("-", "").replace("_", "")[:10].upper()
+    async def create_claim_code(
+        self, agent_id: str, enrollment_id: str, *, ttl_s: int = 600
+    ) -> str:
+        code = secrets.token_urlsafe(12).replace("-", "").replace("_", "")[:16].upper()
+        code_hash = hashlib.sha256(code.encode("ascii")).hexdigest()
         now = time.time()
         await self._db.conn.execute(
-            "UPDATE claim_codes SET expires_at=? WHERE agent_id=? AND claimed_at IS NULL",
+            "UPDATE enrollment_claims SET expires_at=? WHERE agent_id=? AND consumed_at IS NULL",
             (now, agent_id),
         )
         await self._db.conn.execute(
-            "INSERT INTO claim_codes(code,agent_id,created_at,expires_at) VALUES(?,?,?,?)",
-            (code, agent_id, now, now + ttl_s),
+            "INSERT INTO enrollment_claims(code_hash,agent_id,enrollment_id,created_at,expires_at) "
+            "VALUES(?,?,?,?,?)", (code_hash, agent_id, enrollment_id, now, now + ttl_s),
         )
         await self._db.conn.commit()
         return code
 
-    async def claim(self, code: str, owner_id: str, platform: str) -> str | None:
+    async def claim(
+        self,
+        code: str,
+        *,
+        user_id: str,
+        household_id: str,
+        platform: str,
+        attempt_limit: int,
+        attempt_window_s: int,
+    ) -> str | None:
         now = time.time()
+        code_hash = hashlib.sha256(code.encode("ascii")).hexdigest()
         await self._db.conn.execute("BEGIN IMMEDIATE")
         try:
+            rate = await (await self._db.conn.execute(
+                "SELECT window_started_at,attempts FROM claim_rate_limits WHERE user_id=?",
+                (user_id,),
+            )).fetchone()
+            if rate is None or now - rate["window_started_at"] >= attempt_window_s:
+                await self._db.conn.execute(
+                    "INSERT INTO claim_rate_limits(user_id,window_started_at,attempts) VALUES(?,?,1) "
+                    "ON CONFLICT(user_id) DO UPDATE SET window_started_at=excluded.window_started_at,attempts=1",
+                    (user_id, now),
+                )
+            elif rate["attempts"] >= attempt_limit:
+                await self._db.conn.rollback()
+                raise ClaimRateLimited("claim attempt limit reached")
+            else:
+                await self._db.conn.execute(
+                    "UPDATE claim_rate_limits SET attempts=attempts+1 WHERE user_id=?", (user_id,)
+                )
             cursor = await self._db.conn.execute(
-                "SELECT agent_id FROM claim_codes WHERE code=? AND claimed_at IS NULL AND expires_at>?",
-                (code, now),
+                "SELECT c.agent_id FROM enrollment_claims c JOIN agents a ON a.agent_id=c.agent_id "
+                "WHERE c.code_hash=? AND c.consumed_at IS NULL AND c.expires_at>? "
+                "AND c.enrollment_id=a.enrollment_id AND a.household_id IS NULL AND a.revoked_at IS NULL",
+                (code_hash, now),
             )
             row = await cursor.fetchone()
             if row is None:
-                await self._db.conn.rollback()
+                await self._db.conn.commit()
                 return None
             agent_id = row["agent_id"]
-            existing = await (await self._db.conn.execute(
-                "SELECT owner_id FROM agent_ownership WHERE agent_id=?", (agent_id,)
-            )).fetchone()
-            if existing is not None and existing["owner_id"] != owner_id:
-                await self._db.conn.rollback()
+            updated = await self._db.conn.execute(
+                "UPDATE agents SET household_id=? WHERE agent_id=? AND household_id IS NULL",
+                (household_id, agent_id),
+            )
+            if updated.rowcount != 1:
+                await self._db.conn.commit()
                 return None
             await self._db.conn.execute(
                 "INSERT INTO agent_ownership(agent_id,owner_id,claimed_at) VALUES(?,?,?) "
-                "ON CONFLICT(agent_id) DO NOTHING", (agent_id, owner_id, now),
+                "ON CONFLICT(agent_id) DO NOTHING", (agent_id, user_id, now),
             )
-            await self._db.conn.execute("UPDATE claim_codes SET claimed_at=? WHERE code=?", (now, code))
+            await self._db.conn.execute(
+                "UPDATE enrollment_claims SET consumed_at=? WHERE code_hash=? AND consumed_at IS NULL",
+                (now, code_hash),
+            )
             await self._db.conn.execute(
                 "INSERT INTO agent_control_state(agent_id,platform,updated_at) VALUES(?,?,?) "
                 "ON CONFLICT(agent_id) DO UPDATE SET platform=excluded.platform,updated_at=excluded.updated_at",
                 (agent_id, platform, now),
             )
+            await self._db.conn.execute("DELETE FROM claim_rate_limits WHERE user_id=?", (user_id,))
             await self._db.conn.commit()
             return agent_id
         except BaseException:
             await self._db.conn.rollback()
             raise
 
-    async def owns(self, owner_id: str, agent_id: str) -> bool:
+    async def owns(self, household_id: str, agent_id: str) -> bool:
         row = await (await self._db.conn.execute(
-            "SELECT 1 FROM agent_ownership WHERE owner_id=? AND agent_id=?", (owner_id, agent_id)
+            "SELECT 1 FROM agents WHERE household_id=? AND agent_id=? AND revoked_at IS NULL",
+            (household_id, agent_id),
         )).fetchone()
         return row is not None
 
-    async def owned_agents(self, owner_id: str):
+    async def owned_agents(self, household_id: str):
         cursor = await self._db.conn.execute(
             "SELECT a.agent_id,a.enrolled_at,a.last_seen_at,s.* FROM agents a "
-            "JOIN agent_ownership o ON o.agent_id=a.agent_id "
             "LEFT JOIN agent_control_state s ON s.agent_id=a.agent_id "
-            "WHERE o.owner_id=? ORDER BY o.claimed_at", (owner_id,)
+            "WHERE a.household_id=? AND a.revoked_at IS NULL ORDER BY a.enrolled_at", (household_id,)
         )
         return await cursor.fetchall()
 
-    async def get_state(self, owner_id: str, agent_id: str):
+    async def get_state(self, household_id: str, agent_id: str):
         cursor = await self._db.conn.execute(
             "SELECT a.agent_id,a.last_seen_at,s.* FROM agents a "
-            "JOIN agent_ownership o ON o.agent_id=a.agent_id "
             "LEFT JOIN agent_control_state s ON s.agent_id=a.agent_id "
-            "WHERE o.owner_id=? AND a.agent_id=?", (owner_id, agent_id),
+            "WHERE a.household_id=? AND a.agent_id=? AND a.revoked_at IS NULL",
+            (household_id, agent_id),
         )
         return await cursor.fetchone()
 
@@ -114,7 +156,7 @@ class ControlRepo:
             "health_explanation,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(agent_id) DO UPDATE SET platform=excluded.platform,"
             "capabilities_json=excluded.capabilities_json,setup_status=CASE "
-            "WHEN agent_control_state.setup_status IN ('discovering','configuring_camera','selecting_mode') "
+            "WHEN agent_control_state.setup_status IN ('discovering','configuring_camera','selecting_mode','failed') "
             "THEN agent_control_state.setup_status ELSE excluded.setup_status END,"
             "health_state=excluded.health_state,requested_inference_mode=excluded.requested_inference_mode,"
             "effective_inference_mode=excluded.effective_inference_mode,"
@@ -134,12 +176,13 @@ class ControlRepo:
         )
         await self._db.conn.commit()
 
-    async def queue(self, *, agent_id: str, owner_id: str, command_type: CommandType,
+    async def queue(self, *, agent_id: str, household_id: str, requested_by_user_id: str,
+                    command_type: CommandType,
                     payload: dict, idempotency_key: str, ttl_s: int,
                     encrypted_payload: bytes | None = None) -> StoredCommand:
         existing = await (await self._db.conn.execute(
-            "SELECT * FROM queued_commands WHERE owner_id=? AND agent_id=? AND idempotency_key=?",
-            (owner_id, agent_id, idempotency_key),
+            "SELECT * FROM queued_commands WHERE household_id=? AND agent_id=? AND idempotency_key=?",
+            (household_id, agent_id, idempotency_key),
         )).fetchone()
         if existing is not None:
             if (existing["command_type"] != command_type.value
@@ -149,9 +192,11 @@ class ControlRepo:
         now = time.time()
         command_id = f"cmd-{uuid.uuid4().hex}"
         await self._db.conn.execute(
-            "INSERT INTO queued_commands(command_id,agent_id,owner_id,command_type,state,payload_json,"
-            "encrypted_payload,idempotency_key,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-            (command_id, agent_id, owner_id, command_type.value, CommandState.QUEUED.value,
+            "INSERT INTO queued_commands(command_id,agent_id,owner_id,household_id,requested_by_user_id,"
+            "command_type,state,payload_json,encrypted_payload,idempotency_key,created_at,expires_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (command_id, agent_id, requested_by_user_id, household_id, requested_by_user_id,
+             command_type.value, CommandState.QUEUED.value,
              json.dumps(payload, sort_keys=True), encrypted_payload, idempotency_key, now, now + ttl_s),
         )
         setup_status = {
@@ -173,7 +218,7 @@ class ControlRepo:
                    *, delivery_lease_s: int = 30) -> StoredCommand | None:
         now = time.time()
         await self._db.conn.execute(
-            "UPDATE queued_commands SET state='expired',completed_at=? "
+            "UPDATE queued_commands SET state='expired',completed_at=?,encrypted_payload=NULL "
             "WHERE agent_id=? AND state IN ('queued','delivered') AND expires_at<=?", (now, agent_id, now),
         )
         await self._db.conn.execute(
@@ -182,14 +227,16 @@ class ControlRepo:
             (agent_id, now - delivery_lease_s, now),
         )
         row = await (await self._db.conn.execute(
-            "SELECT * FROM queued_commands WHERE agent_id=? AND state='queued' AND expires_at>? "
-            "ORDER BY created_at LIMIT 1", (agent_id, now),
+            "SELECT * FROM queued_commands WHERE agent_id=? AND "
+            "((state='queued' AND expires_at>?) OR (state='running' AND delivered_at<=?)) "
+            "ORDER BY created_at LIMIT 1", (agent_id, now, now - delivery_lease_s),
         )).fetchone()
         if row is None:
             await self._db.conn.commit()
             return None
         await self._db.conn.execute(
-            "UPDATE queued_commands SET state='delivered',delivered_at=? WHERE command_id=?",
+            "UPDATE queued_commands SET state=CASE WHEN state='running' THEN state ELSE 'delivered' END,"
+            "delivered_at=? WHERE command_id=?",
             (now, row["command_id"]),
         )
         await self._db.conn.commit()
@@ -211,7 +258,7 @@ class ControlRepo:
         now = time.time()
         if row["state"] in ("queued", "delivered") and row["expires_at"] <= now:
             await self._db.conn.execute(
-                "UPDATE queued_commands SET state='expired',completed_at=? WHERE command_id=?",
+                "UPDATE queued_commands SET state='expired',completed_at=?,encrypted_payload=NULL WHERE command_id=?",
                 (now, result.command_id),
             )
             await self._db.conn.commit()
@@ -277,6 +324,22 @@ class ControlRepo:
             (agent_id,),
         )).fetchone()
         return json.loads(row["result_json"]) if row else []
+
+    async def command_status(self, household_id: str, agent_id: str, command_id: str) -> dict | None:
+        row = await (await self._db.conn.execute(
+            "SELECT q.state,q.expires_at,r.failure_reason,r.message,r.data_json "
+            "FROM queued_commands q LEFT JOIN command_results r USING(command_id) "
+            "WHERE q.household_id=? AND q.agent_id=? AND q.command_id=?",
+            (household_id, agent_id, command_id),
+        )).fetchone()
+        if row is None:
+            return None
+        state = row["state"]
+        if state in ("queued", "delivered") and row["expires_at"] <= time.time():
+            state = "expired"
+        return {"command_id": command_id, "state": state,
+                "failure_reason": row["failure_reason"], "message": row["message"],
+                "data": json.loads(row["data_json"]) if row["data_json"] else {}}
 
     @staticmethod
     def _row_command(row) -> StoredCommand:

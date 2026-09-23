@@ -11,7 +11,9 @@ from fastapi import APIRouter, Depends, HTTPException
 from mantau_core.notify.recipients import EmergencyContact
 from pydantic import BaseModel
 
+from ...control_auth import authenticated_user
 from ...store.recipient_resolver import SqliteRecipientResolver
+from ...store.identity_repo import UserPrincipal
 from ..deps import get_resolver
 
 router = APIRouter(prefix="/contacts", tags=["contacts"])
@@ -26,22 +28,31 @@ class ContactCreate(BaseModel):
 
 @router.post("", response_model=EmergencyContact, status_code=201)
 async def add_contact(
-    body: ContactCreate, resolver: SqliteRecipientResolver = Depends(get_resolver)
+    body: ContactCreate,
+    resolver: SqliteRecipientResolver = Depends(get_resolver),
+    principal: UserPrincipal = Depends(authenticated_user),
 ) -> EmergencyContact:
     contact = EmergencyContact(
         contact_id=f"contact-{uuid.uuid4().hex[:8]}", name=body.name, phone=body.phone,
         relation=body.relation, priority=body.priority,
     )
-    resolver.add_contact(contact)
+    resolver.add_contact(principal.household_id, contact)
     return contact
 
 
 @router.get("", response_model=list[EmergencyContact])
-async def list_contacts(resolver: SqliteRecipientResolver = Depends(get_resolver)) -> list[EmergencyContact]:
-    return resolver.list_contacts()
+async def list_contacts(
+    resolver: SqliteRecipientResolver = Depends(get_resolver),
+    principal: UserPrincipal = Depends(authenticated_user),
+) -> list[EmergencyContact]:
+    return resolver.list_contacts(principal.household_id)
 
 
 @router.delete("/{contact_id}", status_code=204)
-async def delete_contact(contact_id: str, resolver: SqliteRecipientResolver = Depends(get_resolver)) -> None:
-    if not resolver.delete_contact(contact_id):
-        raise HTTPException(404, f"contact {contact_id!r} not found")
+async def delete_contact(
+    contact_id: str,
+    resolver: SqliteRecipientResolver = Depends(get_resolver),
+    principal: UserPrincipal = Depends(authenticated_user),
+) -> None:
+    if not resolver.delete_contact(principal.household_id, contact_id):
+        raise HTTPException(404, "resource_not_found")

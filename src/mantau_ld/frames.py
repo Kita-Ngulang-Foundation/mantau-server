@@ -21,6 +21,9 @@ from dataclasses import dataclass
 class Frame:
     jpeg: bytes
     received_at: float
+    household_id: str
+    agent_id: str
+    camera_id: str
 
 
 class FrameStore:
@@ -36,14 +39,20 @@ class FrameStore:
         self._waiters: dict[str, asyncio.Event] = {}
         self._stale_after_s = stale_after_s
 
-    def put(self, camera_id: str, jpeg: bytes) -> None:
-        self._frames[camera_id] = Frame(jpeg=jpeg, received_at=time.monotonic())
+    def put(self, camera_id: str, jpeg: bytes, *, household_id: str, agent_id: str) -> None:
+        self._frames[camera_id] = Frame(
+            jpeg=jpeg, received_at=time.monotonic(), household_id=household_id,
+            agent_id=agent_id, camera_id=camera_id,
+        )
         waiter = self._waiters.pop(camera_id, None)
         if waiter is not None:
             waiter.set()
 
-    def latest(self, camera_id: str) -> Frame | None:
-        return self._frames.get(camera_id)
+    def latest(self, camera_id: str, *, household_id: str | None = None) -> Frame | None:
+        frame = self._frames.get(camera_id)
+        if frame is not None and household_id is not None and frame.household_id != household_id:
+            return None
+        return frame
 
     def is_live(self, camera_id: str) -> bool:
         frame = self._frames.get(camera_id)
@@ -51,7 +60,9 @@ class FrameStore:
             return False
         return (time.monotonic() - frame.received_at) <= self._stale_after_s
 
-    async def wait_for_next(self, camera_id: str, *, timeout_s: float) -> Frame | None:
+    async def wait_for_next(
+        self, camera_id: str, *, household_id: str, timeout_s: float
+    ) -> Frame | None:
         waiter = self._waiters.get(camera_id)
         if waiter is None:
             waiter = asyncio.Event()
@@ -60,4 +71,4 @@ class FrameStore:
             await asyncio.wait_for(waiter.wait(), timeout=timeout_s)
         except TimeoutError:
             return None
-        return self._frames.get(camera_id)
+        return self.latest(camera_id, household_id=household_id)

@@ -16,6 +16,7 @@ from ..store.cameras_repo import CamerasRepo
 from ..store.control_repo import ControlRepo
 from ..store.db import Database
 from ..store.events_repo import EventsRepo
+from ..store.identity_repo import IdentityRepo
 from ..store.recipient_resolver import SqliteRecipientResolver
 from ..store.token_store import SqliteTokenStore
 
@@ -42,6 +43,10 @@ def get_control_repo(request: Request) -> ControlRepo:
 
 def get_events_repo(request: Request) -> EventsRepo:
     return request.app.state.events_repo
+
+
+def get_identity_repo(request: Request) -> IdentityRepo:
+    return request.app.state.identity_repo
 
 
 def get_token_store(request: Request) -> SqliteTokenStore:

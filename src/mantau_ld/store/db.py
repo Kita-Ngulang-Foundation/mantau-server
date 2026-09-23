@@ -1,7 +1,7 @@
 """The one SQLite connection the whole server shares, WAL mode, schema on connect.
 
-Same single-account simplification as mantau-backend-rtsp: `device_tokens`
-and `emergency_contacts` are account-global, not per-camera.
+Every user-visible durable resource is linked to a household. Existing v1
+databases are expanded and backfilled without dropping their legacy tables.
 
 `ingested_envelopes` is the dedupe ledger: `PRIMARY KEY (agent_id, seq)`
 means a second INSERT for an already-seen pair fails outright -- that
@@ -11,27 +11,72 @@ guaranteed no-op. See `ingest/dedupe.py`.
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import aiosqlite
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version     INTEGER PRIMARY KEY,
+    applied_at  REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS users (
+    user_id     TEXT PRIMARY KEY,
+    created_at  REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS user_identities (
+    oidc_issuer   TEXT NOT NULL,
+    oidc_subject  TEXT NOT NULL,
+    user_id       TEXT NOT NULL,
+    PRIMARY KEY (oidc_issuer, oidc_subject),
+    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS households (
+    household_id  TEXT PRIMARY KEY,
+    name          TEXT NOT NULL,
+    created_at    REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS household_memberships (
+    household_id  TEXT NOT NULL,
+    user_id       TEXT NOT NULL,
+    role          TEXT NOT NULL,
+    created_at    REAL NOT NULL,
+    PRIMARY KEY (household_id, user_id),
+    FOREIGN KEY (household_id) REFERENCES households(household_id) ON DELETE CASCADE,
+    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS agents (
-    agent_id      TEXT PRIMARY KEY,
-    secret        TEXT NOT NULL,
-    enrolled_at   REAL NOT NULL,
-    last_seen_at  REAL
+    agent_id           TEXT PRIMARY KEY,
+    secret             TEXT NOT NULL,
+    enrollment_id      TEXT NOT NULL,
+    credential_version INTEGER NOT NULL DEFAULT 1,
+    household_id       TEXT,
+    enrolled_at        REAL NOT NULL,
+    last_seen_at       REAL,
+    revoked_at         REAL,
+    FOREIGN KEY (household_id) REFERENCES households(household_id)
 );
 
 CREATE TABLE IF NOT EXISTS cameras (
     camera_id      TEXT PRIMARY KEY,
     name           TEXT NOT NULL,
+    household_id   TEXT,
     agent_id       TEXT,
-    registered_at  REAL NOT NULL
+    registered_at  REAL NOT NULL,
+    FOREIGN KEY (household_id) REFERENCES households(household_id),
+    FOREIGN KEY (agent_id) REFERENCES agents(agent_id)
 );
 
 CREATE TABLE IF NOT EXISTS events (
     event_id     TEXT PRIMARY KEY,
+    household_id TEXT,
+    agent_id     TEXT,
     camera_id    TEXT NOT NULL,
     kind         TEXT NOT NULL,
     severity     TEXT NOT NULL,
@@ -40,23 +85,44 @@ CREATE TABLE IF NOT EXISTS events (
     track_id     INTEGER,
     signals_json TEXT NOT NULL,
     status       TEXT NOT NULL DEFAULT 'needs_review',
-    created_at   REAL NOT NULL
+    created_at   REAL NOT NULL,
+    FOREIGN KEY (household_id) REFERENCES households(household_id),
+    FOREIGN KEY (agent_id) REFERENCES agents(agent_id),
+    FOREIGN KEY (camera_id) REFERENCES cameras(camera_id)
 );
 
 CREATE TABLE IF NOT EXISTS device_tokens (
     device_id      TEXT PRIMARY KEY,
+    user_id        TEXT,
+    household_id   TEXT,
     platform       TEXT NOT NULL,
     token          TEXT NOT NULL UNIQUE,
     registered_at  TEXT NOT NULL,
-    last_seen_at   TEXT NOT NULL
+    last_seen_at   TEXT NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(user_id),
+    FOREIGN KEY (household_id) REFERENCES households(household_id)
 );
 
 CREATE TABLE IF NOT EXISTS emergency_contacts (
     contact_id  TEXT PRIMARY KEY,
+    household_id TEXT,
     name        TEXT NOT NULL,
     phone       TEXT NOT NULL,
     relation    TEXT NOT NULL,
-    priority    INTEGER NOT NULL
+    priority    INTEGER NOT NULL,
+    FOREIGN KEY (household_id) REFERENCES households(household_id)
+);
+
+CREATE TABLE IF NOT EXISTS recordings (
+    recording_id TEXT PRIMARY KEY,
+    household_id TEXT NOT NULL,
+    event_id     TEXT NOT NULL,
+    camera_id    TEXT NOT NULL,
+    storage_key  TEXT NOT NULL,
+    created_at   REAL NOT NULL,
+    FOREIGN KEY (household_id) REFERENCES households(household_id),
+    FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE CASCADE,
+    FOREIGN KEY (camera_id) REFERENCES cameras(camera_id)
 );
 
 CREATE TABLE IF NOT EXISTS ingested_envelopes (
@@ -74,6 +140,23 @@ CREATE TABLE IF NOT EXISTS claim_codes (
     expires_at  REAL NOT NULL,
     claimed_at  REAL,
     FOREIGN KEY (agent_id) REFERENCES agents(agent_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS enrollment_claims (
+    code_hash       TEXT PRIMARY KEY,
+    agent_id        TEXT NOT NULL,
+    enrollment_id   TEXT NOT NULL,
+    created_at      REAL NOT NULL,
+    expires_at      REAL NOT NULL,
+    consumed_at     REAL,
+    FOREIGN KEY (agent_id) REFERENCES agents(agent_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS claim_rate_limits (
+    user_id          TEXT PRIMARY KEY,
+    window_started_at REAL NOT NULL,
+    attempts         INTEGER NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS agent_ownership (
@@ -101,6 +184,8 @@ CREATE TABLE IF NOT EXISTS queued_commands (
     command_id          TEXT PRIMARY KEY,
     agent_id            TEXT NOT NULL,
     owner_id            TEXT NOT NULL,
+    household_id        TEXT,
+    requested_by_user_id TEXT,
     command_type        TEXT NOT NULL,
     state               TEXT NOT NULL,
     payload_json        TEXT NOT NULL,
@@ -111,7 +196,9 @@ CREATE TABLE IF NOT EXISTS queued_commands (
     delivered_at        REAL,
     completed_at        REAL,
     UNIQUE(owner_id, agent_id, idempotency_key),
-    FOREIGN KEY (agent_id) REFERENCES agents(agent_id) ON DELETE CASCADE
+    FOREIGN KEY (agent_id) REFERENCES agents(agent_id) ON DELETE CASCADE,
+    FOREIGN KEY (household_id) REFERENCES households(household_id),
+    FOREIGN KEY (requested_by_user_id) REFERENCES users(user_id)
 );
 
 CREATE TABLE IF NOT EXISTS command_results (
@@ -136,6 +223,97 @@ CREATE TABLE IF NOT EXISTS discovery_results (
 CREATE INDEX IF NOT EXISTS idx_commands_agent_state
 ON queued_commands(agent_id, state, created_at);
 """
+
+
+def _stable_id(prefix: str, value: str) -> str:
+    digest = hashlib.sha256(f"{prefix}:{value}".encode("utf-8")).hexdigest()[:24]
+    return f"{prefix}-{digest}"
+
+
+async def _columns(conn: aiosqlite.Connection, table: str) -> set[str]:
+    rows = await (await conn.execute(f"PRAGMA table_info({table})")).fetchall()
+    return {row[1] for row in rows}
+
+
+async def _add_column(conn: aiosqlite.Connection, table: str, definition: str) -> None:
+    name = definition.split()[0]
+    if name not in await _columns(conn, table):
+        await conn.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
+
+
+async def _migrate_existing(conn: aiosqlite.Connection) -> None:
+    """Expand legacy databases in place; old tables/columns remain usable for rollback."""
+    await _add_column(conn, "agents", "enrollment_id TEXT")
+    await _add_column(conn, "agents", "credential_version INTEGER NOT NULL DEFAULT 1")
+    await _add_column(conn, "agents", "household_id TEXT REFERENCES households(household_id)")
+    await _add_column(conn, "agents", "revoked_at REAL")
+    await _add_column(conn, "cameras", "household_id TEXT REFERENCES households(household_id)")
+    await _add_column(conn, "events", "household_id TEXT REFERENCES households(household_id)")
+    await _add_column(conn, "events", "agent_id TEXT REFERENCES agents(agent_id)")
+    await _add_column(conn, "device_tokens", "user_id TEXT REFERENCES users(user_id)")
+    await _add_column(conn, "device_tokens", "household_id TEXT REFERENCES households(household_id)")
+    await _add_column(conn, "emergency_contacts", "household_id TEXT REFERENCES households(household_id)")
+    await _add_column(conn, "queued_commands", "household_id TEXT REFERENCES households(household_id)")
+    await _add_column(conn, "queued_commands", "requested_by_user_id TEXT REFERENCES users(user_id)")
+
+    agents = await (await conn.execute(
+        "SELECT agent_id,enrolled_at FROM agents WHERE enrollment_id IS NULL OR enrollment_id=''"
+    )).fetchall()
+    for row in agents:
+        enrollment_id = _stable_id("enrollment", f"{row['agent_id']}:{row['enrolled_at']}")
+        await conn.execute(
+            "UPDATE agents SET enrollment_id=? WHERE agent_id=?", (enrollment_id, row["agent_id"])
+        )
+
+    ownership = await (await conn.execute(
+        "SELECT agent_id,owner_id,claimed_at FROM agent_ownership ORDER BY claimed_at"
+    )).fetchall()
+    for row in ownership:
+        user_id = _stable_id("user", row["owner_id"])
+        household_id = _stable_id("household", row["owner_id"])
+        await conn.execute(
+            "INSERT OR IGNORE INTO users(user_id,created_at) VALUES(?,?)",
+            (user_id, row["claimed_at"]),
+        )
+        await conn.execute(
+            "INSERT OR IGNORE INTO user_identities(oidc_issuer,oidc_subject,user_id) VALUES('legacy',?,?)",
+            (row["owner_id"], user_id),
+        )
+        await conn.execute(
+            "INSERT OR IGNORE INTO households(household_id,name,created_at) VALUES(?,?,?)",
+            (household_id, "Migrated household", row["claimed_at"]),
+        )
+        await conn.execute(
+            "INSERT OR IGNORE INTO household_memberships(household_id,user_id,role,created_at) "
+            "VALUES(?,?,'owner',?)", (household_id, user_id, row["claimed_at"]),
+        )
+        await conn.execute(
+            "UPDATE agents SET household_id=? WHERE agent_id=? AND household_id IS NULL",
+            (household_id, row["agent_id"]),
+        )
+        await conn.execute(
+            "UPDATE queued_commands SET household_id=?,requested_by_user_id=? "
+            "WHERE agent_id=? AND household_id IS NULL",
+            (household_id, user_id, row["agent_id"]),
+        )
+
+    await conn.execute(
+        "UPDATE cameras SET household_id=(SELECT household_id FROM agents WHERE agents.agent_id=cameras.agent_id) "
+        "WHERE household_id IS NULL AND agent_id IS NOT NULL"
+    )
+    await conn.execute(
+        "UPDATE events SET household_id=(SELECT household_id FROM cameras WHERE cameras.camera_id=events.camera_id),"
+        "agent_id=(SELECT agent_id FROM cameras WHERE cameras.camera_id=events.camera_id) "
+        "WHERE household_id IS NULL"
+    )
+    await conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(2,strftime('%s','now'))"
+    )
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_agents_household ON agents(household_id,agent_id)")
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_cameras_household ON cameras(household_id,camera_id)")
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_events_household ON events(household_id,created_at)")
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_tokens_household ON device_tokens(household_id,user_id)")
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_contacts_household ON emergency_contacts(household_id,priority)")
 
 
 def _connect_target(path: str) -> tuple[str, bool]:
@@ -165,6 +343,7 @@ class Database:
         await self._conn.execute("PRAGMA journal_mode=WAL")
         await self._conn.execute("PRAGMA foreign_keys=ON")
         await self._conn.executescript(SCHEMA)
+        await _migrate_existing(self._conn)
         await self._conn.commit()
 
     async def close(self) -> None:

@@ -27,17 +27,30 @@ from mantau_ld.config import Settings
 
 EXAMPLES_DIR = Path(__file__).resolve().parents[2] / "protocol" / "examples"
 FIXED_TIME = datetime(2026, 9, 13, 4, 12, 3, 114000, tzinfo=timezone.utc)
+USER = {"X-Mantau-User-ID": "fixture-user"}
 
 
 def _load(name: str) -> dict:
     return json.loads((EXAMPLES_DIR / name).read_text(encoding="utf-8"))
 
 
+def _enroll_claim_camera(client: TestClient, camera_id: str) -> str:
+    enrolled = client.post("/agents/enroll", json={"agent_id": "agent-1"}).json()
+    assert client.post("/agent-claims", headers=USER, json={
+        "claim_code": enrolled["claim_code"], "platform": "linux",
+    }).status_code == 200
+    assert client.post("/cameras", headers=USER, json={
+        "camera_id": camera_id, "name": camera_id, "agent_id": "agent-1",
+    }).status_code == 201
+    return enrolled["secret"]
+
+
 def test_server_accepts_a_fall_event_shaped_like_the_golden_fixture():
     golden = _load("fall_event_envelope.json")["payload"]
 
-    with TestClient(create_app(Settings(db_path=":memory:"))) as client:
-        secret = client.post("/agents/enroll", json={"agent_id": "agent-1"}).json()["secret"]
+    settings = Settings(db_path=":memory:", control_plane_mode="local_dev")
+    with TestClient(create_app(settings)) as client:
+        secret = _enroll_claim_camera(client, golden["camera_id"])
 
         event = FallEvent(
             event_id=golden["event_id"], camera_id=golden["camera_id"],
@@ -51,7 +64,7 @@ def test_server_accepts_a_fall_event_shaped_like_the_golden_fixture():
         assert r.status_code == 200
         assert r.json()["duplicate"] is False
 
-        stored = client.get(f"/events/{event.event_id}").json()
+        stored = client.get(f"/events/{event.event_id}", headers=USER).json()
         assert stored["confidence"] == golden["confidence"]
         assert stored["camera_id"] == golden["camera_id"]
 
@@ -59,8 +72,9 @@ def test_server_accepts_a_fall_event_shaped_like_the_golden_fixture():
 def test_server_accepts_a_heartbeat_shaped_like_the_golden_fixture():
     golden = _load("heartbeat_envelope.json")["payload"]
 
-    with TestClient(create_app(Settings(db_path=":memory:"))) as client:
-        secret = client.post("/agents/enroll", json={"agent_id": "agent-1"}).json()["secret"]
+    settings = Settings(db_path=":memory:", control_plane_mode="local_dev")
+    with TestClient(create_app(settings)) as client:
+        secret = _enroll_claim_camera(client, golden["camera_id"])
 
         heartbeat = Heartbeat(
             agent_id="agent-1", camera_id=golden["camera_id"], sent_at=FIXED_TIME,

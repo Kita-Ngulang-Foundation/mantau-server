@@ -144,3 +144,46 @@ def test_production_mode_fails_closed_without_auth_configuration(tmp_path):
                          control_plane_auth_tokens_json="{}")
     with TestClient(create_app(settings)) as client:
         assert client.get("/agents").status_code == 503
+
+
+def test_running_command_recovers_after_restart_and_results_are_owner_scoped(tmp_path):
+    settings = _settings(tmp_path)
+    with TestClient(create_app(settings)) as client:
+        enrolled = _enroll_and_claim(client)
+        receipt = client.post('/agents/agent-1/camera-tests', headers={**USER, 'Idempotency-Key': 'recover'}, json={
+            'camera': {'name': 'Room', 'host': '192.0.2.1'},
+            'credentials': {'username': 'user', 'password': 'private-camera-value'},
+        }).json()
+        command_id = receipt['command_id']
+        headers = _agent_headers(enrolled)
+        assert client.post('/agent-control/commands/poll', headers=headers, json={}).status_code == 200
+        assert client.post(f'/agent-control/commands/{command_id}/results', headers=headers, json={
+            'command_id': command_id, 'state': 'running', 'completed_at': None,
+        }).status_code == 204
+    # A real server restart, with the acknowledged command still in flight.
+    with sqlite3.connect(tmp_path / 'control.db') as db:
+        db.execute('UPDATE queued_commands SET expires_at=0')
+    with TestClient(create_app(settings)) as client:
+        command = client.post('/agent-control/commands/poll', headers=headers, json={}).json()
+        assert command['command_id'] == command_id
+        assert 'password' not in command['payload']  # retained only by agent's encrypted ledger
+        assert client.post(f'/agent-control/commands/{command_id}/results', headers=headers, json={
+            'command_id': command_id, 'state': 'succeeded', 'data': {'success': True},
+        }).status_code == 204
+        path = f'/agents/agent-1/commands/{command_id}'
+        assert client.get(path, headers=OTHER).status_code == 404
+        result = client.get(path, headers=USER)
+        assert result.json()['state'] == 'succeeded'
+        assert 'private-camera-value' not in result.text
+        assert client.post('/agent-control/commands/poll', headers=headers, json={}).status_code == 204
+
+
+def test_invalid_camera_request_does_not_echo_secrets(tmp_path):
+    with TestClient(create_app(_settings(tmp_path))) as client:
+        _enroll_and_claim(client)
+        response = client.post('/agents/agent-1/camera-tests', headers={**USER, 'Idempotency-Key': 'invalid'}, json={
+            'camera': {'host': '192.0.2.1'},
+            'credentials': {'password': 'private-camera-value'},
+        })
+        assert response.status_code == 422
+        assert 'private-camera-value' not in response.text

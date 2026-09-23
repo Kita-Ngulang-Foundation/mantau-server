@@ -1,7 +1,7 @@
 """Implements `mantau_core.notify.channels.push.tokens.TokenStore` against SQLite.
 
-`tokens_for_camera` returns every registered device regardless of
-`camera_id` -- the account-global simplification documented in `db.py`.
+`tokens_for_camera` resolves camera ownership and returns only that household's
+registered devices.
 """
 
 from __future__ import annotations
@@ -18,23 +18,32 @@ class SqliteTokenStore:
         self._db = db
 
     def register(self, token: DeviceToken) -> None:
+        if not token.user_id or not token.household_id:
+            raise ValueError("owned device token required")
         with self._db.lock:
             self._db.conn.execute(
-                "INSERT INTO device_tokens (device_id, platform, token, registered_at, last_seen_at) "
-                "VALUES (?, ?, ?, ?, ?) "
+                "INSERT INTO device_tokens(device_id,user_id,household_id,platform,token,registered_at,last_seen_at) "
+                "VALUES(?,?,?,?,?,?,?) "
                 "ON CONFLICT(device_id) DO UPDATE SET platform=excluded.platform, "
-                "token=excluded.token, last_seen_at=excluded.last_seen_at",
-                (token.device_id, token.platform.value, token.token,
+                "token=excluded.token,last_seen_at=excluded.last_seen_at "
+                "WHERE device_tokens.user_id=excluded.user_id "
+                "AND device_tokens.household_id=excluded.household_id",
+                (token.device_id, token.user_id, token.household_id, token.platform.value, token.token,
                  token.registered_at.isoformat(), token.last_seen_at.isoformat()),
             )
             self._db.conn.commit()
 
     def tokens_for_camera(self, camera_id: str) -> list[DeviceToken]:
         with self._db.lock:
-            rows = self._db.conn.execute("SELECT * FROM device_tokens").fetchall()
+            rows = self._db.conn.execute(
+                "SELECT d.* FROM device_tokens d JOIN cameras c ON c.household_id=d.household_id "
+                "WHERE c.camera_id=? AND d.user_id IS NOT NULL AND d.household_id IS NOT NULL",
+                (camera_id,),
+            ).fetchall()
         return [
             DeviceToken(device_id=r["device_id"], platform=Platform(r["platform"]),
-                        token=r["token"], registered_at=r["registered_at"],
+                        token=r["token"], user_id=r["user_id"], household_id=r["household_id"],
+                        registered_at=r["registered_at"],
                         last_seen_at=r["last_seen_at"])
             for r in rows
         ]
@@ -50,4 +59,12 @@ class SqliteTokenStore:
     def prune(self, token: str) -> None:
         with self._db.lock:
             self._db.conn.execute("DELETE FROM device_tokens WHERE token = ?", (token,))
+            self._db.conn.commit()
+
+    def delete_owned(self, device_id: str, *, user_id: str, household_id: str) -> None:
+        with self._db.lock:
+            self._db.conn.execute(
+                "DELETE FROM device_tokens WHERE device_id=? AND user_id=? AND household_id=?",
+                (device_id, user_id, household_id),
+            )
             self._db.conn.commit()

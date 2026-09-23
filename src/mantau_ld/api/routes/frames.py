@@ -5,10 +5,9 @@ enrolled secret) but deliberately does NOT use an Envelope: envelopes carry a
 sequence number through dedupe and the durable spool, which is exactly wrong
 for frames -- they're disposable, and a retried frame is a stale frame.
 
-Read endpoints are unauthenticated, matching `/events` and the rest of this
-server's current posture (see the README's "Known gaps" -- no auth anywhere
-yet). That's a real gap to close before this is in front of anyone's actual
-camera, not something this route invented.
+Read endpoints require user authentication and household ownership. Uploads
+remain on the separate agent-authentication path and are bound to a camera
+owned by that enrolled agent.
 """
 
 from __future__ import annotations
@@ -19,9 +18,12 @@ import hmac
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 
+from ...control_auth import authenticated_user
 from ...frames import FrameStore
 from ...store.agents_repo import AgentsRepo
-from ..deps import get_agents_repo, get_frames
+from ...store.cameras_repo import CamerasRepo
+from ...store.identity_repo import UserPrincipal
+from ..deps import get_agents_repo, get_cameras_repo, get_frames
 
 router = APIRouter(tags=["frames"])
 
@@ -33,13 +35,13 @@ _STREAM_IDLE_TIMEOUT_S = 5.0
 
 async def _verify(camera_id: str, body: bytes, agent_id: str, signature: str, agents: AgentsRepo) -> None:
     agent = await agents.get(agent_id)
-    if agent is None:
-        raise HTTPException(401, "unknown_agent")
+    if agent is None or agent.revoked_at is not None or agent.household_id is None:
+        raise HTTPException(401, "unauthorized")
     expected = hmac.new(
         agent.secret.encode("utf-8"), camera_id.encode("utf-8") + b"." + body, hashlib.sha256
     ).hexdigest()
     if not hmac.compare_digest(expected, signature):
-        raise HTTPException(401, "invalid_signature")
+        raise HTTPException(401, "unauthorized")
 
 
 @router.post("/cameras/{camera_id}/frame", status_code=204)
@@ -49,19 +51,33 @@ async def push_frame(
     x_mantau_agent: str = Header(...),
     x_mantau_signature: str = Header(...),
     agents: AgentsRepo = Depends(get_agents_repo),
+    cameras: CamerasRepo = Depends(get_cameras_repo),
     frames: FrameStore = Depends(get_frames),
 ) -> Response:
     body = await request.body()
     await _verify(camera_id, body, x_mantau_agent, x_mantau_signature, agents)
-    frames.put(camera_id, body)
+    agent = await agents.get(x_mantau_agent)
+    camera = await cameras.get_for_agent(x_mantau_agent, camera_id)
+    if agent is None or camera is None or agent.household_id is None:
+        raise HTTPException(401, "unauthorized")
+    frames.put(
+        camera_id, body, household_id=agent.household_id, agent_id=x_mantau_agent
+    )
     return Response(status_code=204)
 
 
 @router.get("/cameras/{camera_id}/snapshot.jpg")
-async def snapshot(camera_id: str, frames: FrameStore = Depends(get_frames)) -> Response:
-    frame = frames.latest(camera_id)
+async def snapshot(
+    camera_id: str,
+    frames: FrameStore = Depends(get_frames),
+    cameras: CamerasRepo = Depends(get_cameras_repo),
+    principal: UserPrincipal = Depends(authenticated_user),
+) -> Response:
+    if await cameras.get_for_household(principal.household_id, camera_id) is None:
+        raise HTTPException(404, "resource_not_found")
+    frame = frames.latest(camera_id, household_id=principal.household_id)
     if frame is None:
-        raise HTTPException(404, "no frame received for this camera yet")
+        raise HTTPException(404, "resource_not_found")
     return Response(
         content=frame.jpeg,
         media_type="image/jpeg",
@@ -72,11 +88,19 @@ async def snapshot(camera_id: str, frames: FrameStore = Depends(get_frames)) -> 
 
 
 @router.get("/cameras/{camera_id}/live.mjpeg")
-async def live(camera_id: str, frames: FrameStore = Depends(get_frames)) -> StreamingResponse:
+async def live(
+    camera_id: str,
+    frames: FrameStore = Depends(get_frames),
+    cameras: CamerasRepo = Depends(get_cameras_repo),
+    principal: UserPrincipal = Depends(authenticated_user),
+) -> StreamingResponse:
+    if await cameras.get_for_household(principal.household_id, camera_id) is None:
+        raise HTTPException(404, "resource_not_found")
+
     async def stream():
         # Start from whatever is already current: a viewer opening a stream on
         # a live camera must not stare at nothing until the next push happens.
-        current = frames.latest(camera_id)
+        current = frames.latest(camera_id, household_id=principal.household_id)
         while True:
             if current is not None:
                 jpeg = current.jpeg
@@ -84,10 +108,15 @@ async def live(camera_id: str, frames: FrameStore = Depends(get_frames)) -> Stre
                     f"--{_BOUNDARY}\r\nContent-Type: image/jpeg\r\n"
                     f"Content-Length: {len(jpeg)}\r\n\r\n"
                 ).encode() + jpeg + b"\r\n"
-            nxt = await frames.wait_for_next(camera_id, timeout_s=_STREAM_IDLE_TIMEOUT_S)
+            nxt = await frames.wait_for_next(
+                camera_id, household_id=principal.household_id,
+                timeout_s=_STREAM_IDLE_TIMEOUT_S,
+            )
             # On idle timeout, re-send what we have rather than going silent --
             # keeps the connection (and any proxy in front of it) alive.
-            current = nxt if nxt is not None else frames.latest(camera_id)
+            current = nxt if nxt is not None else frames.latest(
+                camera_id, household_id=principal.household_id
+            )
 
     return StreamingResponse(
         stream(),

@@ -1,18 +1,18 @@
 """The FastAPI app factory: wire mantau_core + this repo's own store/ingest
 into `app.state`, once, in `lifespan`.
 
-Channel selection mirrors mantau-backend-rtsp exactly: push if FCM is
-configured, Telegram if a bot token + chat ids are configured (TEMPORARY,
-see mantau_core.notify.channels.telegram), and a console fallback if
-neither is -- so a fresh checkout with zero secrets still demonstrates the
-full ingest -> dispatch -> alert path, just to stdout.
+Production uses owned push recipients only. Explicit local-development mode
+may additionally use the legacy Telegram or console demonstration channels.
 """
 
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from mantau_core.notify import ChannelBinding, Fanout, FixedBinding, PushBinding, TelegramBinding
 from mantau_core.notify.channels.console import ConsoleChannel
@@ -24,15 +24,24 @@ from ..alerts.dispatcher import AlertDispatcher
 from ..config import Settings
 from ..frames import FrameStore
 from ..heartbeats import HeartbeatTracker
+from ..oidc_auth import OidcAuthenticator
 from ..store.agents_repo import AgentsRepo
 from ..store.cameras_repo import CamerasRepo
 from ..store.control_repo import ControlRepo
 from ..store.db import Database
 from ..store.events_repo import EventsRepo
+from ..store.identity_repo import IdentityRepo
 from ..store.recipient_resolver import SqliteRecipientResolver
 from ..store.sync_db import SyncDatabase
 from ..store.token_store import SqliteTokenStore
-from .routes import agents, cameras, contacts, control, devices, events, frames, health, ingest
+log = logging.getLogger("mantau_ld")
+# aiosqlite logs every statement with its parameters at DEBUG, which would put
+# agent secrets, claim-code hashes, and FCM tokens into logs.
+logging.getLogger("aiosqlite").setLevel(logging.INFO)
+
+from .routes import (  # noqa: E402
+    agents, cameras, contacts, control, devices, events, frames, health, households, ingest,
+)
 
 
 def _build_channels(
@@ -43,10 +52,11 @@ def _build_channels(
         credentials = ServiceAccountCredentials(settings.fcm_service_account_path)
         fcm = FCMPushChannel(settings.fcm_project_id, credentials, token_store)
         channels.append(PushBinding(notifier=fcm, resolver=resolver))
-    if settings.telegram_configured and settings.telegram_chat_id_list():
+    if (settings.control_plane_mode == "local_dev" and settings.telegram_configured
+            and settings.telegram_chat_id_list()):
         telegram = TelegramChannel(settings.telegram_bot_token)
         channels.append(TelegramBinding(notifier=telegram, chat_ids=settings.telegram_chat_id_list()))
-    if not channels:
+    if not channels and settings.control_plane_mode == "local_dev":
         print("[mantau-ld] no push/Telegram configured -- alerts go to the console only")
         # FixedBinding, not PushBinding: a console fallback must fire
         # regardless of whether any device is registered yet -- PushBinding
@@ -56,16 +66,33 @@ def _build_channels(
     return channels
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    *,
+    oidc_authenticator: OidcAuthenticator | None = None,
+) -> FastAPI:
     settings = settings or Settings()
+    oidc_authenticator = oidc_authenticator or OidcAuthenticator(
+        issuer=settings.oidc_issuer,
+        audience=settings.oidc_audience,
+        jwks_url=settings.oidc_jwks_url,
+        algorithms=settings.oidc_algorithm_list(),
+        leeway_s=settings.oidc_leeway_s,
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        problems = settings.configuration_problems()
+        if problems:
+            # Serving continues so /ready can report it; user routes already
+            # fail closed (503) without OIDC.
+            log.error("mantau-server misconfigured; missing: %s", ", ".join(problems))
         db = Database(settings.db_path)
         await db.connect()
         sync_db = SyncDatabase(settings.db_path)
 
         agents_repo = AgentsRepo(db)
+        identity_repo = IdentityRepo(db)
         control_repo = ControlRepo(db)
         cameras_repo = CamerasRepo(db)
         events_repo = EventsRepo(db)
@@ -79,6 +106,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.db = db
         app.state.sync_db = sync_db
         app.state.agents_repo = agents_repo
+        app.state.identity_repo = identity_repo
         app.state.control_repo = control_repo
         app.state.cameras_repo = cameras_repo
         app.state.events_repo = events_repo
@@ -89,19 +117,40 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.heartbeats = HeartbeatTracker()
         app.state.frames = FrameStore()
 
-        yield
+        try:
+            yield
+        finally:
+            await db.close()
+            sync_db.close()
 
-        await db.close()
-        sync_db.close()
-
-    app = FastAPI(title="mantau-backend-localdevice (server)", version="0.1.0", lifespan=lifespan)
-    app.add_middleware(
-        CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
+    docs = settings.docs_enabled
+    app = FastAPI(
+        title="mantau-server", version="0.1.0", lifespan=lifespan,
+        docs_url="/docs" if docs else None,
+        redoc_url="/redoc" if docs else None,
+        openapi_url="/openapi.json" if docs else None,
     )
+    app.state.oidc_authenticator = oidc_authenticator
+    @app.exception_handler(RequestValidationError)
+    async def invalid_request(request, exc):
+        # FastAPI's default errors echo rejected input, including passwords.
+        return JSONResponse(status_code=422, content={"detail": [
+            {"loc": error["loc"], "type": error["type"], "msg": "Invalid value"}
+            for error in exc.errors()
+        ]})
+    if settings.cors_origin_list():
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=settings.cors_origin_list(),
+            allow_methods=["GET", "POST", "PUT", "DELETE"],
+            allow_headers=["Authorization", "Content-Type", "Idempotency-Key",
+                           "X-Mantau-Household-ID"],
+        )
     app.include_router(health.router)
     app.include_router(ingest.router)
     app.include_router(agents.router)
     app.include_router(control.router)
+    app.include_router(households.router)
     app.include_router(cameras.router)
     app.include_router(events.router)
     app.include_router(devices.router)

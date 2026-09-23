@@ -17,10 +17,13 @@ from mantau_ld.config import Settings
 from mantau_ld.frames import FrameStore
 
 JPEG = b"\xff\xd8\xff\xe0not-a-real-jpeg-but-opaque-bytes\xff\xd9"
+USER = {"X-Mantau-User-ID": "user-a"}
 
 
 def _client() -> TestClient:
-    return TestClient(create_app(Settings(db_path=":memory:")))
+    return TestClient(create_app(Settings(
+        db_path=":memory:", control_plane_mode="local_dev"
+    )))
 
 
 def _sign(secret: str, camera_id: str, body: bytes) -> str:
@@ -30,7 +33,14 @@ def _sign(secret: str, camera_id: str, body: bytes) -> str:
 
 
 def _enroll(client: TestClient, agent_id: str = "agent-1") -> str:
-    return client.post("/agents/enroll", json={"agent_id": agent_id}).json()["secret"]
+    enrolled = client.post("/agents/enroll", json={"agent_id": agent_id}).json()
+    assert client.post("/agent-claims", headers=USER, json={
+        "claim_code": enrolled["claim_code"], "platform": "linux",
+    }).status_code == 200
+    assert client.post("/cameras", headers=USER, json={
+        "camera_id": "cam-1", "name": "Room", "agent_id": agent_id,
+    }).status_code == 201
+    return enrolled["secret"]
 
 
 def _push(client: TestClient, secret: str, *, camera_id="cam-1", agent_id="agent-1", body=JPEG):
@@ -50,7 +60,7 @@ def test_pushed_frame_is_served_back_as_a_snapshot():
         secret = _enroll(client)
         assert _push(client, secret).status_code == 204
 
-        r = client.get("/cameras/cam-1/snapshot.jpg")
+        r = client.get("/cameras/cam-1/snapshot.jpg", headers=USER)
         assert r.status_code == 200
         assert r.headers["content-type"] == "image/jpeg"
         assert r.content == JPEG
@@ -63,12 +73,12 @@ def test_latest_frame_wins():
         secret = _enroll(client)
         _push(client, secret, body=b"older")
         _push(client, secret, body=b"newer")
-        assert client.get("/cameras/cam-1/snapshot.jpg").content == b"newer"
+        assert client.get("/cameras/cam-1/snapshot.jpg", headers=USER).content == b"newer"
 
 
 def test_snapshot_404s_before_any_frame_arrives():
     with _client() as client:
-        assert client.get("/cameras/never-pushed/snapshot.jpg").status_code == 404
+        assert client.get("/cameras/never-pushed/snapshot.jpg", headers=USER).status_code == 404
 
 
 def test_frame_push_rejects_a_bad_signature():
@@ -84,7 +94,7 @@ def test_frame_push_rejects_a_bad_signature():
             },
         )
         assert r.status_code == 401
-        assert client.get("/cameras/cam-1/snapshot.jpg").status_code == 404
+        assert client.get("/cameras/cam-1/snapshot.jpg", headers=USER).status_code == 404
 
 
 def test_frame_push_rejects_an_unknown_agent():
@@ -106,7 +116,7 @@ def test_store_exposes_the_current_frame_for_a_joining_viewer():
     """
     store = FrameStore()
     assert store.latest("cam-1") is None
-    store.put("cam-1", JPEG)
+    store.put("cam-1", JPEG, household_id="household-1", agent_id="agent-1")
     assert store.latest("cam-1").jpeg == JPEG
     assert store.is_live("cam-1")
 

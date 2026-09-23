@@ -11,7 +11,9 @@ from mantau_core.telemetry import Stage
 from pydantic import BaseModel
 
 from ...alerts.dispatcher import AlertDispatcher
+from ...control_auth import authenticated_user
 from ...store.events_repo import VALID_STATUSES, EventsRepo
+from ...store.identity_repo import UserPrincipal
 from ..deps import get_ack_service, get_dispatcher, get_events_repo
 
 router = APIRouter(prefix="/events", tags=["events"])
@@ -35,22 +37,31 @@ class EventOut(BaseModel):
         )
 
 
-async def _out(event: FallEvent, repo: EventsRepo) -> EventOut:
-    status = await repo.get_status(event.event_id) or "needs_review"
+async def _out(event: FallEvent, repo: EventsRepo, household_id: str) -> EventOut:
+    status = await repo.get_status(household_id, event.event_id) or "needs_review"
     return EventOut.from_event(event, status)
 
 
 @router.get("", response_model=list[EventOut])
-async def list_events(limit: int = 100, repo: EventsRepo = Depends(get_events_repo)) -> list[EventOut]:
-    return [await _out(e, repo) for e in await repo.list_all(limit=limit)]
+async def list_events(
+    limit: int = 100,
+    repo: EventsRepo = Depends(get_events_repo),
+    principal: UserPrincipal = Depends(authenticated_user),
+) -> list[EventOut]:
+    events = await repo.list_for_household(principal.household_id, limit=limit)
+    return [await _out(e, repo, principal.household_id) for e in events]
 
 
 @router.get("/{event_id}", response_model=EventOut)
-async def get_event(event_id: str, repo: EventsRepo = Depends(get_events_repo)) -> EventOut:
-    event = await repo.get(event_id)
+async def get_event(
+    event_id: str,
+    repo: EventsRepo = Depends(get_events_repo),
+    principal: UserPrincipal = Depends(authenticated_user),
+) -> EventOut:
+    event = await repo.get(principal.household_id, event_id)
     if event is None:
-        raise HTTPException(404, f"event {event_id!r} not found")
-    return await _out(event, repo)
+        raise HTTPException(404, "resource_not_found")
+    return await _out(event, repo, principal.household_id)
 
 
 class AckRequest(BaseModel):
@@ -70,10 +81,11 @@ async def ack_event(
     repo: EventsRepo = Depends(get_events_repo),
     ack_service: AckService = Depends(get_ack_service),
     dispatcher: AlertDispatcher = Depends(get_dispatcher),
+    principal: UserPrincipal = Depends(authenticated_user),
 ) -> AckResponse:
-    if await repo.get(event_id) is None:
-        raise HTTPException(404, f"event {event_id!r} not found")
-    first = ack_service.ack(event_id, member_id=body.member_id)
+    if await repo.get(principal.household_id, event_id) is None:
+        raise HTTPException(404, "resource_not_found")
+    first = ack_service.ack(event_id, member_id=principal.user_id)
     trace = dispatcher.get_trace(event_id)
     if trace is not None:
         trace.stamp(Stage.ACKED)
@@ -92,14 +104,15 @@ async def get_latency(
     event_id: str,
     repo: EventsRepo = Depends(get_events_repo),
     dispatcher: AlertDispatcher = Depends(get_dispatcher),
+    principal: UserPrincipal = Depends(authenticated_user),
 ) -> LatencyOut:
     """The per-stage breakdown behind the project's actual claim: under 5
     seconds, captured to delivered. Mirrors mantau-backend-rtsp's identical
     route -- `mantau-testbed`'s comparison harness reads this from both
     backends to build one table instead of trusting two different partial
     views."""
-    if await repo.get(event_id) is None:
-        raise HTTPException(404, f"event {event_id!r} not found")
+    if await repo.get(principal.household_id, event_id) is None:
+        raise HTTPException(404, "resource_not_found")
     trace = dispatcher.get_trace(event_id)
     if trace is None:
         return LatencyOut(event_id=event_id, summary={}, within_budget_delivered=None)
@@ -113,12 +126,14 @@ class StatusRequest(BaseModel):
 
 @router.post("/{event_id}/status", response_model=EventOut)
 async def set_status(
-    event_id: str, body: StatusRequest, repo: EventsRepo = Depends(get_events_repo)
+    event_id: str, body: StatusRequest,
+    repo: EventsRepo = Depends(get_events_repo),
+    principal: UserPrincipal = Depends(authenticated_user),
 ) -> EventOut:
-    event = await repo.get(event_id)
+    event = await repo.get(principal.household_id, event_id)
     if event is None:
-        raise HTTPException(404, f"event {event_id!r} not found")
+        raise HTTPException(404, "resource_not_found")
     if body.status not in VALID_STATUSES:
         raise HTTPException(400, f"invalid status, must be one of {sorted(VALID_STATUSES)}")
-    await repo.set_status(event_id, body.status)
+    await repo.set_status(principal.household_id, event_id, body.status)
     return EventOut.from_event(event, body.status)

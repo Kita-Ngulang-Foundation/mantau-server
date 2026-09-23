@@ -7,8 +7,9 @@ FROM python:3.12-slim
 WORKDIR /app
 COPY . /app
 
+# mantau-core.ref holds the one pinned commit; CI tests against the same one.
 RUN pip install --no-cache-dir \
-      "mantau-core[push] @ https://github.com/Kita-Ngulang-Foundation/mantau-core/archive/75111dd24f03324a60cf4a06ae9218defbc0595a.tar.gz" \
+      "mantau-core[push] @ https://github.com/Kita-Ngulang-Foundation/mantau-core/archive/$(tr -d '[:space:]' < mantau-core.ref).tar.gz" \
  && pip install --no-cache-dir -e .
 
 ENV MANTAU_DB_PATH=/data/mantau_ld.db

@@ -21,23 +21,30 @@ class SqliteRecipientResolver:
         return self._token_store.tokens_for_camera(camera_id)
 
     def emergency_contacts_for_camera(self, camera_id: str) -> list[EmergencyContact]:
-        return self.list_contacts()
+        with self._db.lock:
+            row = self._db.conn.execute(
+                "SELECT household_id FROM cameras WHERE camera_id=?", (camera_id,)
+            ).fetchone()
+        return self.list_contacts(row["household_id"]) if row and row["household_id"] else []
 
-    def add_contact(self, contact: EmergencyContact) -> None:
+    def add_contact(self, household_id: str, contact: EmergencyContact) -> None:
         with self._db.lock:
             self._db.conn.execute(
-                "INSERT INTO emergency_contacts (contact_id, name, phone, relation, priority) "
-                "VALUES (?, ?, ?, ?, ?) "
+                "INSERT INTO emergency_contacts(contact_id,household_id,name,phone,relation,priority) "
+                "VALUES(?,?,?,?,?,?) "
                 "ON CONFLICT(contact_id) DO UPDATE SET name=excluded.name, phone=excluded.phone, "
-                "relation=excluded.relation, priority=excluded.priority",
-                (contact.contact_id, contact.name, contact.phone, contact.relation, contact.priority),
+                "relation=excluded.relation,priority=excluded.priority "
+                "WHERE emergency_contacts.household_id=excluded.household_id",
+                (contact.contact_id, household_id, contact.name, contact.phone,
+                 contact.relation, contact.priority),
             )
             self._db.conn.commit()
 
-    def list_contacts(self) -> list[EmergencyContact]:
+    def list_contacts(self, household_id: str) -> list[EmergencyContact]:
         with self._db.lock:
             rows = self._db.conn.execute(
-                "SELECT * FROM emergency_contacts ORDER BY priority ASC"
+                "SELECT * FROM emergency_contacts WHERE household_id=? ORDER BY priority ASC",
+                (household_id,),
             ).fetchall()
         return [
             EmergencyContact(contact_id=r["contact_id"], name=r["name"], phone=r["phone"],
@@ -45,10 +52,11 @@ class SqliteRecipientResolver:
             for r in rows
         ]
 
-    def delete_contact(self, contact_id: str) -> bool:
+    def delete_contact(self, household_id: str, contact_id: str) -> bool:
         with self._db.lock:
             cursor = self._db.conn.execute(
-                "DELETE FROM emergency_contacts WHERE contact_id = ?", (contact_id,)
+                "DELETE FROM emergency_contacts WHERE household_id=? AND contact_id=?",
+                (household_id, contact_id),
             )
             self._db.conn.commit()
             return cursor.rowcount > 0

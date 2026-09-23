@@ -5,18 +5,19 @@ a signed envelope. See `../../../../protocol/PROTOCOL.md`.
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from ...store.agents_repo import AgentsRepo
-from ...control_auth import current_user
+from ...store.agents_repo import AgentIdentityProofRequired, AgentsRepo
+from ...control_auth import authenticated_user
 from ...store.control_repo import ControlRepo
+from ...store.identity_repo import UserPrincipal
 from ..deps import get_agents_repo, get_control_repo
 
 router = APIRouter(prefix="/agents", tags=["agents"])
 
 
 class AgentEnroll(BaseModel):
-    agent_id: str
+    agent_id: str = Field(min_length=3, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 class AgentEnrolled(BaseModel):
@@ -32,28 +33,39 @@ class AgentOut(BaseModel):
 
 
 @router.post("/enroll", response_model=AgentEnrolled, status_code=201)
-async def enroll(body: AgentEnroll, repo: AgentsRepo = Depends(get_agents_repo),
+async def enroll(body: AgentEnroll, request: Request,
+                 repo: AgentsRepo = Depends(get_agents_repo),
                  control: ControlRepo = Depends(get_control_repo)) -> AgentEnrolled:
-    """Enrolling an already-enrolled id issues a fresh secret (the old one
-    stops working immediately) -- equivalent to revoke + re-enroll."""
-    agent = await repo.enroll(body.agent_id)
-    claim_code = await control.create_claim_code(agent.agent_id)
+    """Initial enrollment is create-only; an existing identity is rotated only
+    with proof of its current secret (X-Mantau-Agent-ID/-Secret headers).
+
+    Without proof, an existing id answers 409 so a new device picks another
+    name; with wrong proof it answers 401. Neither changes the stored agent."""
+    proof_id = request.headers.get("X-Mantau-Agent-ID", "")
+    current_secret = request.headers.get("X-Mantau-Agent-Secret", "")
+    if proof_id != body.agent_id:
+        current_secret = ""
+    try:
+        agent = await repo.enroll(body.agent_id, current_secret=current_secret or None)
+    except AgentIdentityProofRequired as exc:
+        if not current_secret:
+            raise HTTPException(409, "agent_id_taken") from exc
+        raise HTTPException(401, "unauthorized") from exc
+    claim_code = None
+    if agent.household_id is None:
+        claim_code = await control.create_claim_code(
+            agent.agent_id, agent.enrollment_id,
+            ttl_s=request.app.state.settings.claim_code_ttl_s,
+        )
     return AgentEnrolled(agent_id=agent.agent_id, secret=agent.secret, claim_code=claim_code)
 
 
 @router.get("")
 async def list_agents(request: Request, repo: AgentsRepo = Depends(get_agents_repo),
-                      control: ControlRepo = Depends(get_control_repo)):
-    # Compatibility window: when the new control plane is disabled this is
-    # byte-for-byte the legacy inventory. Enabling it switches to owned views.
-    if request.app.state.settings.control_plane_mode != "disabled":
-        owner_id = current_user(request)
-        return [_agent_status(row, request.app.state.settings.agent_offline_after_s)
-                for row in await control.owned_agents(owner_id)]
-    return [
-        AgentOut(agent_id=a.agent_id, enrolled_at=a.enrolled_at, last_seen_at=a.last_seen_at)
-        for a in await repo.list_all()
-    ]
+                      control: ControlRepo = Depends(get_control_repo),
+                      principal: UserPrincipal = Depends(authenticated_user)):
+    return [_agent_status(row, request.app.state.settings.agent_offline_after_s)
+            for row in await control.owned_agents(principal.household_id)]
 
 
 def _agent_status(row, offline_after_s: int) -> dict:
@@ -81,8 +93,11 @@ def _agent_status(row, offline_after_s: int) -> dict:
 
 
 @router.delete("/{agent_id}", status_code=204)
-async def revoke(agent_id: str, repo: AgentsRepo = Depends(get_agents_repo)) -> None:
+async def revoke(agent_id: str, repo: AgentsRepo = Depends(get_agents_repo),
+                 principal: UserPrincipal = Depends(authenticated_user)) -> None:
     """Every envelope this agent sends afterward fails verification (401) --
     there is no grace period."""
-    if not await repo.revoke(agent_id):
-        raise HTTPException(404, f"agent {agent_id!r} not found")
+    if principal.role not in ("owner", "admin"):
+        raise HTTPException(403, "forbidden")
+    if not await repo.revoke(agent_id, principal.household_id):
+        raise HTTPException(404, "resource_not_found")

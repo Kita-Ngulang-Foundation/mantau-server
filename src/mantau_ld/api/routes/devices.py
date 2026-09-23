@@ -5,10 +5,14 @@ app-initiated cases.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+import sqlite3
+
+from fastapi import APIRouter, Depends, HTTPException
 from mantau_core.notify.channels.push.tokens import DeviceToken, Platform
 from pydantic import BaseModel
 
+from ...control_auth import authenticated_user
+from ...store.identity_repo import UserPrincipal
 from ...store.token_store import SqliteTokenStore
 from ..deps import get_token_store
 
@@ -23,11 +27,25 @@ class DeviceRegister(BaseModel):
 
 @router.post("/register", status_code=204)
 async def register_device(
-    body: DeviceRegister, store: SqliteTokenStore = Depends(get_token_store)
+    body: DeviceRegister,
+    store: SqliteTokenStore = Depends(get_token_store),
+    principal: UserPrincipal = Depends(authenticated_user),
 ) -> None:
-    store.register(DeviceToken(device_id=body.device_id, platform=Platform(body.platform), token=body.token))
+    try:
+        store.register(DeviceToken(
+            device_id=body.device_id, platform=Platform(body.platform), token=body.token,
+            user_id=principal.user_id, household_id=principal.household_id,
+        ))
+    except (ValueError, sqlite3.IntegrityError) as exc:
+        raise HTTPException(409, "resource_conflict") from exc
 
 
-@router.delete("/{token}", status_code=204)
-async def unregister_device(token: str, store: SqliteTokenStore = Depends(get_token_store)) -> None:
-    store.prune(token)
+@router.delete("/{device_id}", status_code=204)
+async def unregister_device(
+    device_id: str,
+    store: SqliteTokenStore = Depends(get_token_store),
+    principal: UserPrincipal = Depends(authenticated_user),
+) -> None:
+    store.delete_owned(
+        device_id, user_id=principal.user_id, household_id=principal.household_id
+    )

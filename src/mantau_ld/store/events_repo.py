@@ -32,43 +32,47 @@ class EventsRepo:
     def __init__(self, db: Database) -> None:
         self._db = db
 
-    async def insert(self, event: FallEvent) -> None:
+    async def insert(self, event: FallEvent, *, household_id: str, agent_id: str) -> None:
         await self._db.conn.execute(
-            "INSERT INTO events (event_id, camera_id, kind, severity, occurred_at, "
-            "confidence, track_id, signals_json, status, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'needs_review', ?)",
-            (event.event_id, event.camera_id, event.kind.value, event.severity.value,
+            "INSERT INTO events(event_id,household_id,agent_id,camera_id,kind,severity,occurred_at,"
+            "confidence,track_id,signals_json,status,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,'needs_review',?)",
+            (event.event_id, household_id, agent_id, event.camera_id,
+             event.kind.value, event.severity.value,
              event.occurred_at.isoformat(), event.confidence, event.track_id,
              json.dumps(event.signals), time.time()),
         )
         await self._db.conn.commit()
 
-    async def list_all(self, *, limit: int = 100) -> list[FallEvent]:
+    async def list_for_household(self, household_id: str, *, limit: int = 100) -> list[FallEvent]:
         cursor = await self._db.conn.execute(
-            "SELECT * FROM events ORDER BY created_at DESC LIMIT ?", (limit,)
+            "SELECT * FROM events WHERE household_id=? ORDER BY created_at DESC LIMIT ?",
+            (household_id, limit),
         )
         rows = await cursor.fetchall()
         return [_row_to_event(r) for r in rows]
 
-    async def get(self, event_id: str) -> FallEvent | None:
+    async def get(self, household_id: str, event_id: str) -> FallEvent | None:
         cursor = await self._db.conn.execute(
-            "SELECT * FROM events WHERE event_id = ?", (event_id,)
+            "SELECT * FROM events WHERE household_id=? AND event_id=?", (household_id, event_id)
         )
         row = await cursor.fetchone()
         return _row_to_event(row) if row else None
 
-    async def get_status(self, event_id: str) -> str | None:
+    async def get_status(self, household_id: str, event_id: str) -> str | None:
         cursor = await self._db.conn.execute(
-            "SELECT status FROM events WHERE event_id = ?", (event_id,)
+            "SELECT status FROM events WHERE household_id=? AND event_id=?",
+            (household_id, event_id),
         )
         row = await cursor.fetchone()
         return row["status"] if row else None
 
-    async def set_status(self, event_id: str, status: str) -> bool:
+    async def set_status(self, household_id: str, event_id: str, status: str) -> bool:
         if status not in VALID_STATUSES:
             raise ValueError(f"invalid status {status!r}, must be one of {VALID_STATUSES}")
         cursor = await self._db.conn.execute(
-            "UPDATE events SET status = ? WHERE event_id = ?", (status, event_id)
+            "UPDATE events SET status=? WHERE household_id=? AND event_id=?",
+            (status, household_id, event_id),
         )
         await self._db.conn.commit()
         return cursor.rowcount > 0
