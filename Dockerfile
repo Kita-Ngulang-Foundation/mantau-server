@@ -13,6 +13,7 @@ RUN pip install --no-cache-dir \
  && pip install --no-cache-dir -e .
 
 ENV MANTAU_DB_PATH=/data/mantau_ld.db
+ENV MANTAU_RECORDINGS_DIR=/data/recordings
 
 EXPOSE 8100
 # MANTAU_FCM_SERVICE_ACCOUNT_JSON (raw key content, set as a plain Railway

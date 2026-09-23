@@ -270,7 +270,7 @@ async def poll_commands(body: AgentPollRequest, request: Request, response: Resp
 
 
 @router.post("/agent-control/commands/{command_id}/results", status_code=204)
-async def submit_result(command_id: str, result: CommandResult,
+async def submit_result(command_id: str, result: CommandResult, request: Request,
                         agent=Depends(authenticated_agent),
                         repo: ControlRepo = Depends(get_control_repo)):
     if command_id != result.command_id:
@@ -285,3 +285,9 @@ async def submit_result(command_id: str, result: CommandResult,
         raise HTTPException(400, "secret_in_command_result")
     if not await repo.record_result(agent.agent_id, result):
         raise HTTPException(404, "command_not_found")
+    applied = result.data.get("detection_settings_version")
+    camera_id = result.data.get("camera_id")
+    if (result.state is CommandState.SUCCEEDED and isinstance(applied, int)
+            and isinstance(camera_id, str)):
+        await request.app.state.detection_settings_repo.mark_applied(
+            agent.agent_id, camera_id, applied)

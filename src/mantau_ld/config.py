@@ -30,6 +30,14 @@ class Settings(CoreSettings):
     claim_code_ttl_s: int = 600
     claim_attempt_limit: int = 5
     claim_attempt_window_s: int = 60
+    household_invite_ttl_s: int = 48 * 3600
+    # Event clips uploaded by agents. Keep on a persistent volume.
+    recordings_dir: str = "data/recordings"
+    recording_max_bytes: int = 20 * 1024 * 1024
+    recording_retention_days: int = 30
+    frame_max_bytes: int = 2 * 1024 * 1024
+    invite_attempt_limit: int = 10
+    invite_attempt_window_s: int = 3600
 
     # Browser origins allowed to call the API (comma-separated). Empty means no
     # CORS at all -- the mobile app and agents do not need it.

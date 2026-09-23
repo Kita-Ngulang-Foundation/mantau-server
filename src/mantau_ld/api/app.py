@@ -29,6 +29,8 @@ from ..store.agents_repo import AgentsRepo
 from ..store.cameras_repo import CamerasRepo
 from ..store.control_repo import ControlRepo
 from ..store.db import Database
+from ..store.detection_settings_repo import DetectionSettingsRepo
+from ..store.recordings_repo import RecordingsRepo
 from ..store.events_repo import EventsRepo
 from ..store.identity_repo import IdentityRepo
 from ..store.recipient_resolver import SqliteRecipientResolver
@@ -40,7 +42,8 @@ log = logging.getLogger("mantau_ld")
 logging.getLogger("aiosqlite").setLevel(logging.INFO)
 
 from .routes import (  # noqa: E402
-    agents, cameras, contacts, control, devices, events, frames, health, households, ingest,
+    agents, cameras, contacts, control, detection, devices, events, frames, health, households,
+    ingest, recordings,
 )
 
 
@@ -116,6 +119,9 @@ def create_app(
         app.state.ack_service = AckService()
         app.state.heartbeats = HeartbeatTracker()
         app.state.frames = FrameStore()
+        app.state.detection_settings_repo = DetectionSettingsRepo(db)
+        app.state.recordings_repo = RecordingsRepo(db, settings.recordings_dir)
+        await app.state.recordings_repo.prune(settings.recording_retention_days)
 
         try:
             yield
@@ -156,4 +162,6 @@ def create_app(
     app.include_router(devices.router)
     app.include_router(contacts.router)
     app.include_router(frames.router)
+    app.include_router(detection.router)
+    app.include_router(recordings.router)
     return app

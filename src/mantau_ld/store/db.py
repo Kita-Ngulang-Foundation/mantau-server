@@ -35,6 +35,37 @@ CREATE TABLE IF NOT EXISTS user_identities (
     FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS household_invites (
+    code_hash     TEXT PRIMARY KEY,
+    household_id  TEXT NOT NULL,
+    created_by    TEXT NOT NULL,
+    role          TEXT NOT NULL,
+    created_at    REAL NOT NULL,
+    expires_at    REAL NOT NULL,
+    consumed_at   REAL,
+    consumed_by   TEXT,
+    FOREIGN KEY (household_id) REFERENCES households(household_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS camera_detection_settings (
+    camera_id        TEXT PRIMARY KEY,
+    household_id     TEXT NOT NULL,
+    settings_json    TEXT NOT NULL,
+    version          INTEGER NOT NULL,
+    updated_at       REAL NOT NULL,
+    updated_by       TEXT NOT NULL,
+    applied_version  INTEGER,
+    applied_at       REAL,
+    FOREIGN KEY (camera_id) REFERENCES cameras(camera_id) ON DELETE CASCADE,
+    FOREIGN KEY (household_id) REFERENCES households(household_id)
+);
+
+CREATE TABLE IF NOT EXISTS rate_limits (
+    bucket             TEXT PRIMARY KEY,
+    window_started_at  REAL NOT NULL,
+    attempts           INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS households (
     household_id  TEXT PRIMARY KEY,
     name          TEXT NOT NULL,
@@ -245,6 +276,16 @@ async def _migrate_existing(conn: aiosqlite.Connection) -> None:
     """Expand legacy databases in place; old tables/columns remain usable for rollback."""
     await _add_column(conn, "agents", "enrollment_id TEXT")
     await _add_column(conn, "agents", "credential_version INTEGER NOT NULL DEFAULT 1")
+    # v3: display-only profile claims for member lists.
+    await _add_column(conn, "users", "email TEXT")
+    await _add_column(conn, "users", "display_name TEXT")
+    # v3: durable acknowledgement and review attribution.
+    await _add_column(conn, "events", "acknowledged_at REAL")
+    await _add_column(conn, "events", "acknowledged_by TEXT")
+    await _add_column(conn, "events", "reviewed_at REAL")
+    await _add_column(conn, "events", "reviewed_by TEXT")
+    await _add_column(conn, "recordings", "size_bytes INTEGER")
+    await _add_column(conn, "recordings", "content_type TEXT")
     await _add_column(conn, "agents", "household_id TEXT REFERENCES households(household_id)")
     await _add_column(conn, "agents", "revoked_at REAL")
     await _add_column(conn, "cameras", "household_id TEXT REFERENCES households(household_id)")
@@ -314,6 +355,10 @@ async def _migrate_existing(conn: aiosqlite.Connection) -> None:
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_events_household ON events(household_id,created_at)")
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_tokens_household ON device_tokens(household_id,user_id)")
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_contacts_household ON emergency_contacts(household_id,priority)")
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_invites_household ON household_invites(household_id)")
+    await conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(3,strftime('%s','now'))"
+    )
 
 
 def _connect_target(path: str) -> tuple[str, bool]:

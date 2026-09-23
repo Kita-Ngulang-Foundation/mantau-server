@@ -1,7 +1,9 @@
 """Implements `mantau_core.notify.channels.push.tokens.TokenStore` against SQLite.
 
-`tokens_for_camera` resolves camera ownership and returns only that household's
-registered devices.
+`tokens_for_camera` resolves camera ownership and returns the devices of every
+current member of that household. A registration belongs to a user, so a
+member of several households gets alerts from all of them, and removing a
+member stops their alerts at once.
 """
 
 from __future__ import annotations
@@ -36,8 +38,11 @@ class SqliteTokenStore:
     def tokens_for_camera(self, camera_id: str) -> list[DeviceToken]:
         with self._db.lock:
             rows = self._db.conn.execute(
-                "SELECT d.* FROM device_tokens d JOIN cameras c ON c.household_id=d.household_id "
-                "WHERE c.camera_id=? AND d.user_id IS NOT NULL AND d.household_id IS NOT NULL",
+                "SELECT d.* FROM device_tokens d "
+                "JOIN cameras c ON c.camera_id=? "
+                "JOIN household_memberships m "
+                "  ON m.household_id=c.household_id AND m.user_id=d.user_id "
+                "WHERE d.user_id IS NOT NULL",
                 (camera_id,),
             ).fetchall()
         return [

@@ -6,7 +6,7 @@ import hmac
 
 from fastapi import HTTPException, Request
 
-from .oidc_auth import OidcConfigurationError, OidcTokenError
+from .oidc_auth import OidcConfigurationError, OidcIdentity, OidcTokenError
 from .store.identity_repo import (
     HouseholdAccessDenied,
     HouseholdSelectionRequired,
@@ -18,14 +18,14 @@ def _unauthorized() -> HTTPException:
     return HTTPException(401, "unauthorized", headers={"WWW-Authenticate": "Bearer"})
 
 
-async def authenticated_identity(request: Request) -> tuple[str, str]:
-    """(issuer, subject) of the app user, before any household is chosen."""
+async def authenticated_identity(request: Request) -> OidcIdentity:
+    """The app user, before any household is chosen."""
     settings = request.app.state.settings
     if settings.control_plane_mode == "local_dev":
         subject = request.headers.get("X-Mantau-User-ID", "").strip()
         if not subject:
             raise _unauthorized()
-        issuer = "local-dev"
+        identity = OidcIdentity(issuer="local-dev", subject=subject)
     elif settings.control_plane_mode == "production":
         try:
             identity = request.app.state.oidc_authenticator.authenticate(
@@ -35,20 +35,20 @@ async def authenticated_identity(request: Request) -> tuple[str, str]:
             raise HTTPException(503, "authentication_unavailable") from exc
         except OidcTokenError as exc:
             raise _unauthorized() from exc
-        issuer, subject = identity.issuer, identity.subject
     else:
         # Retaining the value lets older deployments fail closed rather than
         # failing to parse configuration and silently choosing a user.
         raise HTTPException(503, "authentication_unavailable")
-    return issuer, subject
+    await request.app.state.identity_repo.ensure_user(identity)
+    return identity
 
 
 async def authenticated_user(request: Request) -> UserPrincipal:
-    issuer, subject = await authenticated_identity(request)
+    identity = await authenticated_identity(request)
     requested_household = request.headers.get("X-Mantau-Household-ID", "").strip() or None
     try:
         return await request.app.state.identity_repo.resolve(
-            issuer, subject, requested_household_id=requested_household
+            identity.issuer, identity.subject, requested_household_id=requested_household
         )
     except HouseholdSelectionRequired as exc:
         raise HTTPException(400, "household_required") from exc

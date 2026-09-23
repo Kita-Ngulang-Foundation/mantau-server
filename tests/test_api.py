@@ -161,10 +161,10 @@ def test_device_register_and_unregister():
 def test_contacts_crud_ordered_by_priority():
     with _client() as client:
         client.post("/contacts", headers=USER,
-                    json={"name": "Sari", "phone": "+62-2", "relation": "Cucu",
+                    json={"name": "Sari", "phone": "+62-812-2222", "relation": "Cucu",
                                         "priority": 2})
         client.post("/contacts", headers=USER,
-                    json={"name": "Budi", "phone": "+62-1", "relation": "Anak",
+                    json={"name": "Budi", "phone": "+62-812-1111", "relation": "Anak",
                                         "priority": 1})
         contacts = client.get("/contacts", headers=USER).json()
         assert [c["name"] for c in contacts] == ["Budi", "Sari"]

@@ -74,6 +74,10 @@ the inherited ones -- push/Telegram credentials, backoff defaults):
 | `MANTAU_CLAIM_ATTEMPT_LIMIT` | `5` | Claim attempts allowed per user in one rate window. |
 | `MANTAU_CLAIM_ATTEMPT_WINDOW_S` | `60` | Claim rate-limit window. |
 | `MANTAU_CORS_ORIGINS` | empty | Comma-separated browser origins. Empty disables CORS (the mobile app and agents do not need it). |
+| `MANTAU_RECORDINGS_DIR` | `data/recordings` | Event clips. Put on the same persistent volume as the database. |
+| `MANTAU_RECORDING_RETENTION_DAYS` | `30` | Older clips are deleted. |
+| `MANTAU_RECORDING_MAX_BYTES` / `MANTAU_FRAME_MAX_BYTES` | 20 MB / 2 MB | Upload limits (413 above them). |
+| `MANTAU_HOUSEHOLD_INVITE_TTL_S` | `172800` | Invite code lifetime. |
 | `MANTAU_API_DOCS_ENABLED` | `false` | Serve `/docs`, `/redoc`, `/openapi.json` in production. Always on in `local_dev`. |
 
 ## API
@@ -86,12 +90,17 @@ the inherited ones -- push/Telegram credentials, backoff defaults):
 | `GET /agents`, `DELETE /agents/{id}` | List enrolled agents; revoke one (its envelopes fail verification from then on). |
 | `POST /ingest` | The one endpoint an agent calls. See `../protocol/PROTOCOL.md`. |
 | `POST/GET/DELETE /cameras[/{id}]` | Register a camera's display name (this server holds no RTSP URL or credentials -- the agent owns those). |
-| `GET /events`, `GET /events/{id}` | List / inspect events. |
-| `POST /events/{id}/ack` | A device saw the alert -- closes the latency trace's ACKED stage. |
+| `GET /events`, `GET /events/{id}` | Household event history, newest first; `limit`, `before` (the last `created_at` shown), `kind` filters. Includes camera name, signals, ack/review attribution, and whether a clip exists. |
+| `POST /events/{id}/ack` | First acknowledgement is recorded durably for the calling user; closes the latency trace's ACKED stage. |
 | `POST /events/{id}/status` | Human triage: `needs_review` / `dismissed` / `confirmed`. |
 | `GET /households` | The signed-in user's households (`household_id`, `name`, `role`). The only user route that needs no household selection. |
+| `POST /households/join` | Join a household with a single-use invite code (rate-limited). Needs no household selection. |
+| `PATCH /households/{id}`, `GET /households/{id}/members`, `POST /households/{id}/invites`, `DELETE /households/{id}/members/{user_id}` | Rename, list members, invite (owner/admin; admin invites only by owners), remove or leave. The last owner cannot leave. Push alerts go to every current member. |
+| `GET/PUT /cameras/{id}/detection-settings` | Zones, per-feature thresholds, night window, timezone. Members read; owners/admins write. Each change is a new version delivered to the agent (`apply_detection_settings`); `applied_version` shows what the agent runs. |
+| `POST /events/{id}/recording` | Agent-signed MP4 clip upload for its own event (`HMAC(secret, "<event_id>." + body)`). Refused for bathroom-duration events. Size-limited. |
+| `GET /events/{id}/recording` | Clip download for household members. |
 | `POST /devices/register`, `DELETE /devices/{device_id}` | Household-owned push token lifecycle; raw tokens never appear in URLs. |
-| `POST/GET/DELETE /contacts[/{id}]` | Emergency-contact CRUD (see "Known gaps"). |
+| `POST/GET/PUT/DELETE /contacts[/{id}]`, `PUT /contacts/order` | Emergency contacts (max 10, validated phone numbers); order decides who is called first. |
 
 ## Firebase Authentication
 

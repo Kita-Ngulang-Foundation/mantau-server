@@ -19,6 +19,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 
 from ...control_auth import authenticated_user
+from ..limits import read_limited
 from ...frames import FrameStore
 from ...store.agents_repo import AgentsRepo
 from ...store.cameras_repo import CamerasRepo
@@ -54,7 +55,7 @@ async def push_frame(
     cameras: CamerasRepo = Depends(get_cameras_repo),
     frames: FrameStore = Depends(get_frames),
 ) -> Response:
-    body = await request.body()
+    body = await read_limited(request, request.app.state.settings.frame_max_bytes)
     await _verify(camera_id, body, x_mantau_agent, x_mantau_signature, agents)
     agent = await agents.get(x_mantau_agent)
     camera = await cameras.get_for_agent(x_mantau_agent, camera_id)

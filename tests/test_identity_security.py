@@ -146,7 +146,7 @@ def test_cross_household_routes_and_notification_recipients_are_isolated(tmp_pat
             "device_id": "device-b", "platform": "android", "token": "token-b",
         }).status_code == 204
         contact = client.post("/contacts", headers=user_a, json={
-            "name": "Family A", "phone": "+62001", "relation": "Child", "priority": 1,
+            "name": "Family A", "phone": "+62 811 0001", "relation": "Child", "priority": 1,
         }).json()
 
         event = FallEvent(camera_id="camera-a", confidence=0.91)

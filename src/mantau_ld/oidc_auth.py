@@ -26,6 +26,9 @@ class OidcTokenError(ValueError):
 class OidcIdentity:
     issuer: str
     subject: str
+    # Display only (member lists). Never used for identity or authorization.
+    email: str | None = None
+    name: str | None = None
 
 
 class OidcAuthenticator:
@@ -74,4 +77,10 @@ class OidcAuthenticator:
         subject = claims.get("sub")
         if not isinstance(subject, str) or not subject.strip():
             raise OidcTokenError("invalid bearer token")
-        return OidcIdentity(issuer=self.issuer, subject=subject.strip())
+        email = claims.get("email")
+        name = claims.get("name")
+        return OidcIdentity(
+            issuer=self.issuer, subject=subject.strip(),
+            email=email[:254] if isinstance(email, str) and email else None,
+            name=name[:120] if isinstance(name, str) and name else None,
+        )
