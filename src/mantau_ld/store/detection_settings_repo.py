@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass
 
-from mantau_core.contracts import DetectionSettings
+from mantau_core.contracts import DetectionSettings, Zone
+from pydantic import ValidationError
 
 from .db import Database
 
@@ -15,6 +17,23 @@ class StoredSettings:
     settings: DetectionSettings
     applied_version: int | None
     stored: bool
+
+
+def _tolerant(raw: str) -> DetectionSettings:
+    """Stored settings; zones saved before outline validation existed that are
+    now invalid (self-intersecting, degenerate) are dropped rather than failing."""
+    try:
+        return DetectionSettings.model_validate_json(raw)
+    except ValidationError:
+        data = json.loads(raw)
+        valid = []
+        for zone in data.get("zones", []):
+            try:
+                valid.append(Zone.model_validate(zone))
+            except ValidationError:
+                continue
+        data["zones"] = [z.model_dump(mode="json") for z in valid]
+        return DetectionSettings.model_validate(data)
 
 
 class DetectionSettingsRepo:
@@ -28,8 +47,7 @@ class DetectionSettingsRepo:
         )).fetchone()
         if row is None:
             return StoredSettings(DetectionSettings(), None, False)
-        return StoredSettings(DetectionSettings.model_validate_json(row["settings_json"]),
-                              row["applied_version"], True)
+        return StoredSettings(_tolerant(row["settings_json"]), row["applied_version"], True)
 
     async def save(self, household_id: str, camera_id: str, settings: DetectionSettings,
                    user_id: str) -> DetectionSettings:

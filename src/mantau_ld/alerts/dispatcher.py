@@ -36,7 +36,8 @@ class AlertDispatcher:
         trace.stamp(Stage.DETECTED, at=event.occurred_at.timestamp())
         self.traces[event.event_id] = trace
 
-        await self.events_repo.insert(event, household_id=household_id, agent_id=agent_id)
+        if not await self.events_repo.insert(event, household_id=household_id, agent_id=agent_id):
+            return  # already stored and alerted: a duplicate delivery never alerts twice
         camera_name = await self.cameras_repo.name_for(event.camera_id, household_id)
         await self.fanout.send(event, camera_name=camera_name, trace=trace)
 

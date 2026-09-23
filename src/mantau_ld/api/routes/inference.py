@@ -129,6 +129,8 @@ async def infer(
     captured_at = datetime.fromtimestamp(captured_at_ms / 1000, timezone.utc)
 
     household_id = agent.household_id
+    camera_settings = (await request.app.state.detection_settings_repo.get(
+        household_id, camera_id)).settings
 
     async def work() -> InferenceResult:
         # Only this agent's own events can be confirmed; unknown ids are
@@ -140,7 +142,8 @@ async def infer(
             result = await service.infer(
                 agent_id=agent_id, camera_id=camera_id, session_id=session_id,
                 frame_id=frame_id, ts_ms=ts_ms, captured_at=captured_at,
-                event_ids=tuple(e for e in event_ids if e not in foreign), jpeg=body)
+                event_ids=tuple(e for e in event_ids if e not in foreign), jpeg=body,
+                settings=camera_settings)
         except InferenceUnavailable as exc:
             raise HTTPException(503, "inference_unavailable") from exc
         except CapacityExceeded as exc:

@@ -25,7 +25,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 import numpy as np
-from mantau_core.activity import Posture
+from mantau_core.activity import ActivityEngine, Posture, default_rules
+from mantau_core.contracts import DetectionSettings
 from mantau_core.contracts import (
     FallEvent, InferenceCapability, InferenceConfirmation, InferenceResult,
 )
@@ -79,6 +80,9 @@ class _Session:
     last_seen: float = field(default_factory=time.monotonic)
     last_arrival: float = 0.0
     captured_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    # Prolonged position / nocturnal movement / bathroom duration on this stream,
+    # with the camera's saved settings (the agent does not run them in CLOUD).
+    activity: ActivityEngine = field(default_factory=lambda: ActivityEngine(default_rules()))
 
 
 class InferenceService:
@@ -171,7 +175,7 @@ class InferenceService:
     # -- inference -------------------------------------------------------------
     async def infer(self, *, agent_id: str, camera_id: str, session_id: str, frame_id: str,
                     ts_ms: int, captured_at: datetime, event_ids: tuple[str, ...],
-                    jpeg: bytes) -> InferenceResult:
+                    jpeg: bytes, settings: DetectionSettings | None = None) -> InferenceResult:
         if not self.available:
             raise InferenceUnavailable(self.reason or "Server inference unavailable")
         started = time.perf_counter()
@@ -202,7 +206,12 @@ class InferenceService:
                     self._factory, camera_id, {}, lambda: session.captured_at)
             async with self._cpu:
                 perception = await asyncio.to_thread(session.stream.perceive, image, ts_ms)
-        events = [_server_event(event) for event in perception.events]
+            events = [_server_event(event) for event in perception.events]
+            if perception.observation is not None:
+                if settings is not None:
+                    session.activity.apply_settings(settings)
+                events += [_server_event(event)
+                           for event in session.activity.update(perception.observation)]
         people = (len(perception.observation.people)
                   if perception.observation is not None else None)
         return InferenceResult(frame_id=frame_id, session_id=session_id, processed=True,

@@ -289,6 +289,7 @@ async def _migrate_existing(conn: aiosqlite.Connection) -> None:
     await _add_column(conn, "agents", "enrollment_id TEXT")
     await _add_column(conn, "agents", "credential_version INTEGER NOT NULL DEFAULT 1")
     # v3: display-only profile claims for member lists.
+    await _add_column(conn, "events", "zone_id TEXT")
     await _add_column(conn, "users", "email TEXT")
     await _add_column(conn, "users", "display_name TEXT")
     # v3: durable acknowledgement and review attribution.

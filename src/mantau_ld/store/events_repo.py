@@ -26,6 +26,7 @@ def _row_to_event(row: aiosqlite.Row) -> FallEvent:
         kind=EventKind(row["kind"]), severity=Severity(row["severity"]),
         occurred_at=row["occurred_at"], confidence=row["confidence"],
         track_id=row["track_id"], signals=json.loads(row["signals_json"]),
+        zone_id=row["zone_id"] if "zone_id" in row.keys() else None,
     )
 
 
@@ -124,17 +125,20 @@ class EventsRepo:
         await self._db.conn.commit()
         return cursor.rowcount > 0
 
-    async def insert(self, event: FallEvent, *, household_id: str, agent_id: str) -> None:
-        await self._db.conn.execute(
-            "INSERT INTO events(event_id,household_id,agent_id,camera_id,kind,severity,occurred_at,"
-            "confidence,track_id,signals_json,status,created_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,'needs_review',?)",
+    async def insert(self, event: FallEvent, *, household_id: str, agent_id: str) -> bool:
+        """Store an event; False when this event id is already stored (activity
+        rules give an episode the same id every time, so a re-delivery is a no-op)."""
+        cursor = await self._db.conn.execute(
+            "INSERT OR IGNORE INTO events(event_id,household_id,agent_id,camera_id,kind,severity,"
+            "occurred_at,confidence,track_id,signals_json,zone_id,status,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,'needs_review',?)",
             (event.event_id, household_id, agent_id, event.camera_id,
              event.kind.value, event.severity.value,
              event.occurred_at.isoformat(), event.confidence, event.track_id,
-             json.dumps(event.signals), time.time()),
+             json.dumps(event.signals), event.zone_id, time.time()),
         )
         await self._db.conn.commit()
+        return cursor.rowcount > 0
 
     async def list_for_household(self, household_id: str, *, limit: int = 100) -> list[FallEvent]:
         cursor = await self._db.conn.execute(

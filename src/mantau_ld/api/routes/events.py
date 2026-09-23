@@ -37,6 +37,8 @@ class EventOut(BaseModel):
     confidence: float
     status: str
     signals: dict[str, float] = {}
+    # The household zone an activity event happened in (its id), if any.
+    zone_id: str | None = None
     created_at: float | None = None      # pagination cursor for `before`
     acknowledged_at: datetime | None = None
     acknowledged_by: str | None = None
@@ -55,6 +57,7 @@ class EventOut(BaseModel):
             camera_name=record.camera_name, kind=event.kind.value,
             severity=event.severity.value, occurred_at=event.occurred_at.isoformat(),
             confidence=event.confidence, status=record.status, signals=event.signals,
+            zone_id=event.zone_id,
             created_at=record.created_at,
             acknowledged_at=_ts(record.acknowledged_at), acknowledged_by=record.acknowledged_by,
             reviewed_at=_ts(record.reviewed_at), reviewed_by=record.reviewed_by,
