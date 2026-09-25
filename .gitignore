@@ -29,3 +29,4 @@ Thumbs.db
 
 # CI checkout of mantau-core
 .deps/
+private-deps/

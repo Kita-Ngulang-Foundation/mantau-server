@@ -199,3 +199,14 @@ CI. Bump it only to a commit that is pushed to
 `Kita-Ngulang-Foundation/mantau-core`. Point the platform health check at
 `/ready`: a deploy missing OIDC, the Fernet key, or FCM settings stays
 unhealthy instead of silently serving.
+
+For a Railway Hobby deployment with server inference, build a wheel from the
+`mantau-AI` commit pinned by `mantau-core` into
+`private-deps/mantau_prototype-0.1.0-py3-none-any.whl` in a clean archive of
+this repository's `main` commit. Set Railway's `MANTAU_REQUIRE_DETECTOR=1`
+variable and upload that archive with `railway up --no-gitignore`.
+`private-deps/` is Git-ignored; do not add the wheel to the repository. The
+Dockerfile checks for it and fails the build if it is required but absent.
+This uses Railway's source upload and needs no private image registry or
+GitHub token in Railway. A GitHub-only build without the wheel will fail while
+the requirement is enabled; repeat the clean archive upload for each release.
