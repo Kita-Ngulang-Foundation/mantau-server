@@ -104,7 +104,7 @@ the inherited ones -- push/Telegram credentials, backoff defaults):
 | `GET /households` | The signed-in user's households (`household_id`, `name`, `role`). The only user route that needs no household selection. |
 | `POST /households/join` | Join a household with a single-use invite code (rate-limited). Needs no household selection. |
 | `PATCH /households/{id}`, `GET /households/{id}/members`, `POST /households/{id}/invites`, `DELETE /households/{id}/members/{user_id}` | Rename, list members, invite (owner/admin; admin invites only by owners), remove or leave. The last owner cannot leave. Push alerts go to every current member. |
-| `GET/PUT /cameras/{id}/detection-settings` | Zones, per-feature thresholds, night window, timezone. Members read; owners/admins write. Each change is a new version delivered to the agent (`apply_detection_settings`); `applied_version` shows what the agent runs. |
+| `GET/PUT /cameras/{id}/detection-settings` | Zones, per-feature thresholds, night window, timezone. Members read; owners/admins write. Each change is a new version delivered to the agent (`apply_detection_settings`); `applied_version` shows what the agent runs. One-time startup migration (schema version 4): stored `stillness.floor_minutes` exactly 2.0 (the old default) becomes 0.5, with a new version and a queued `apply_detection_settings`; other values are kept. |
 | `POST /events/{id}/recording` | Agent-signed MP4 clip upload for its own event (`HMAC(secret, "<event_id>." + body)`). Refused for bathroom-duration events. Size-limited. |
 | `GET /events/{id}/recording` | Clip download for household members. |
 | `GET /inference/capability` | Whether this server runs the fall detector, with its frame limits. No tenant data; agents read it at startup. |

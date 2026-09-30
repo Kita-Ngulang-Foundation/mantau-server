@@ -146,7 +146,7 @@ def test_cloud_agents_get_activity_rules_on_the_server():
             assert r.status_code == 200, r.text
             found += r.json()["events"]
         kinds = [(e["kind"], e["severity"]) for e in found]
-        assert kinds == [("stillness", "warning"), ("stillness", "critical")]
+        assert kinds == [("stillness", "critical")]
         stored = client.get(f"/events/{found[0]['event_id']}", headers=A).json()
         assert stored["signals"]["duration_s"] == 30.0
         assert client.get(f"/events/{found[0]['event_id']}", headers=B).status_code == 404

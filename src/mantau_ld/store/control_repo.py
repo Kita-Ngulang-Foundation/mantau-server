@@ -179,7 +179,9 @@ class ControlRepo:
     async def queue(self, *, agent_id: str, household_id: str, requested_by_user_id: str,
                     command_type: CommandType,
                     payload: dict, idempotency_key: str, ttl_s: int,
-                    encrypted_payload: bytes | None = None) -> StoredCommand:
+                    encrypted_payload: bytes | None = None,
+                    commit: bool = True) -> StoredCommand:
+        """`commit=False` leaves the insert in the caller's open transaction."""
         existing = await (await self._db.conn.execute(
             "SELECT * FROM queued_commands WHERE household_id=? AND agent_id=? AND idempotency_key=?",
             (household_id, agent_id, idempotency_key),
@@ -210,7 +212,8 @@ class ControlRepo:
                 "UPDATE agent_control_state SET setup_status=?,updated_at=? WHERE agent_id=?",
                 (setup_status, now, agent_id),
             )
-        await self._db.conn.commit()
+        if commit:
+            await self._db.conn.commit()
         return StoredCommand(command_id, agent_id, command_type.value, "queued", payload,
                              encrypted_payload, now, now + ttl_s)
 
