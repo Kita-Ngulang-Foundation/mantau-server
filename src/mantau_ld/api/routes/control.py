@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import json
-import time
-import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from mantau_core.contracts import (
-    AgentClaimStatus, CameraRequestMetadata, ClaimStatus, CommandReceipt,
+    CameraRequestMetadata, CommandReceipt,
     CommandResult, CommandState, CommandType, ControlCommand, InferenceMode,
 )
 from pydantic import BaseModel, Field
@@ -15,17 +13,12 @@ from pydantic import BaseModel, Field
 from ...control_auth import authenticated_agent, authenticated_user
 from ...control_crypto import CredentialCipher
 from ...store.cameras_repo import CamerasRepo
-from ...store.control_repo import ClaimRateLimited, ControlRepo, IdempotencyConflict
+from ...store.control_repo import ControlRepo, IdempotencyConflict
 from ...store.identity_repo import UserPrincipal
 from ..deps import get_cameras_repo, get_control_repo
 from .agents import _agent_status
 
 router = APIRouter(tags=["control-plane"])
-
-
-class ClaimRequest(BaseModel):
-    claim_code: str
-    platform: str
 
 
 class CameraCredentialsIn(BaseModel):
@@ -81,26 +74,6 @@ async def _queue(request: Request, repo: ControlRepo, principal: UserPrincipal, 
                           state=CommandState(command.state))
 
 
-@router.post("/agent-claims")
-async def claim_agent(body: ClaimRequest, request: Request,
-                      repo: ControlRepo = Depends(get_control_repo),
-                      principal: UserPrincipal = Depends(authenticated_user)):
-    platform = "linux_x86_64" if body.platform == "linux" else body.platform
-    try:
-        agent_id = await repo.claim(
-            body.claim_code.strip().upper(), user_id=principal.user_id,
-            household_id=principal.household_id, platform=platform,
-            attempt_limit=request.app.state.settings.claim_attempt_limit,
-            attempt_window_s=request.app.state.settings.claim_attempt_window_s,
-        )
-    except ClaimRateLimited as exc:
-        raise HTTPException(429, "claim_rate_limited") from exc
-    if agent_id is None:
-        raise HTTPException(404, "resource_not_found")
-    row = await repo.get_state(principal.household_id, agent_id)
-    return _agent_status(row, request.app.state.settings.agent_offline_after_s)
-
-
 @router.get("/agents/{agent_id}/setup")
 async def setup_status(agent_id: str, request: Request,
                        repo: ControlRepo = Depends(get_control_repo),
@@ -110,7 +83,7 @@ async def setup_status(agent_id: str, request: Request,
         raise HTTPException(404, "resource_not_found")
     status = row["setup_status"] or "not_started"
     messages = {
-        "not_started": "Agent is claimed and waiting for setup.",
+        "not_started": "Agent is enrolled and waiting for setup.",
         "waiting_for_agent": "Waiting for the agent to connect.",
         "discovering": "Discovering cameras on the agent LAN.",
         "configuring_camera": "Applying camera configuration.",
@@ -215,34 +188,10 @@ async def reconfigure(agent_id: str, request: Request,
                         {}, _key(idempotency_key))
 
 
-class ClaimCodeOut(BaseModel):
-    claim_code: str
-    expires_at: datetime
-
-
-@router.post("/agent-control/claim-code", response_model=ClaimCodeOut, status_code=201)
-async def refresh_claim_code(request: Request, agent=Depends(authenticated_agent),
-                             repo: ControlRepo = Depends(get_control_repo)):
-    """A fresh single-use claim code for this unclaimed agent. Needs the
-    agent's own credential and never changes it -- unlike rotation, which
-    re-enrolls. A claimed agent never gets another code: moving it to another
-    household requires the current owner to revoke it first."""
-    if agent.household_id is not None:
-        raise HTTPException(409, "agent_already_claimed")
-    ttl_s = request.app.state.settings.claim_code_ttl_s
-    code = await repo.create_claim_code(agent.agent_id, agent.enrollment_id, ttl_s=ttl_s)
-    return ClaimCodeOut(
-        claim_code=code,
-        expires_at=datetime.fromtimestamp(time.time() + ttl_s, timezone.utc),
-    )
-
-
 @router.post("/agent-control/commands/poll", response_model=ControlCommand | None)
 async def poll_commands(body: AgentPollRequest, request: Request, response: Response,
                         agent=Depends(authenticated_agent),
                         repo: ControlRepo = Depends(get_control_repo)):
-    if request.app.state.settings.control_plane_mode == "disabled":
-        raise HTTPException(404, "control_plane_disabled")
     if body.status:
         # The validated status model has no credential-bearing fields; reject
         # obvious mistakes before persistence as a second redaction boundary.

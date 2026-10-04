@@ -84,6 +84,7 @@ CREATE TABLE IF NOT EXISTS household_memberships (
 
 CREATE TABLE IF NOT EXISTS agents (
     agent_id           TEXT PRIMARY KEY,
+    name               TEXT,
     secret             TEXT NOT NULL,
     enrollment_id      TEXT NOT NULL,
     credential_version INTEGER NOT NULL DEFAULT 1,
@@ -176,32 +177,20 @@ CREATE TABLE IF NOT EXISTS ingested_envelopes (
     PRIMARY KEY (agent_id, seq)
 );
 
-CREATE TABLE IF NOT EXISTS claim_codes (
-    code        TEXT PRIMARY KEY,
-    agent_id    TEXT NOT NULL,
-    created_at  REAL NOT NULL,
-    expires_at  REAL NOT NULL,
-    claimed_at  REAL,
-    FOREIGN KEY (agent_id) REFERENCES agents(agent_id) ON DELETE CASCADE
+CREATE TABLE IF NOT EXISTS agent_enrollment_keys (
+    key_id        TEXT PRIMARY KEY,
+    key_hash      TEXT NOT NULL UNIQUE,
+    household_id  TEXT NOT NULL,
+    created_by    TEXT NOT NULL,
+    created_at    REAL NOT NULL,
+    expires_at    REAL NOT NULL,
+    consumed_at   REAL,
+    revoked_at    REAL,
+    agent_id      TEXT,
+    FOREIGN KEY (household_id) REFERENCES households(household_id) ON DELETE CASCADE
 );
 
-CREATE TABLE IF NOT EXISTS enrollment_claims (
-    code_hash       TEXT PRIMARY KEY,
-    agent_id        TEXT NOT NULL,
-    enrollment_id   TEXT NOT NULL,
-    created_at      REAL NOT NULL,
-    expires_at      REAL NOT NULL,
-    consumed_at     REAL,
-    FOREIGN KEY (agent_id) REFERENCES agents(agent_id) ON DELETE CASCADE
-);
-
-CREATE TABLE IF NOT EXISTS claim_rate_limits (
-    user_id          TEXT PRIMARY KEY,
-    window_started_at REAL NOT NULL,
-    attempts         INTEGER NOT NULL,
-    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
-);
-
+-- Legacy (v2): read only by the v2 migration below; nothing writes it now.
 CREATE TABLE IF NOT EXISTS agent_ownership (
     agent_id    TEXT PRIMARY KEY,
     owner_id    TEXT NOT NULL,
@@ -288,6 +277,7 @@ async def _migrate_existing(conn: aiosqlite.Connection) -> None:
     """Expand legacy databases in place; old tables/columns remain usable for rollback."""
     await _add_column(conn, "agents", "enrollment_id TEXT")
     await _add_column(conn, "agents", "credential_version INTEGER NOT NULL DEFAULT 1")
+    await _add_column(conn, "agents", "name TEXT")
     # v3: display-only profile claims for member lists.
     await _add_column(conn, "events", "zone_id TEXT")
     await _add_column(conn, "users", "email TEXT")
@@ -371,6 +361,19 @@ async def _migrate_existing(conn: aiosqlite.Connection) -> None:
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_invites_household ON household_invites(household_id)")
     await conn.execute(
         "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(3,strftime('%s','now'))"
+    )
+    # v4: agents join a household with an enrollment key; the anonymous
+    # enroll-then-claim tables are gone. Unclaimed agents can never be used.
+    for table in ("claim_codes", "enrollment_claims", "claim_rate_limits"):
+        await conn.execute(f"DROP TABLE IF EXISTS {table}")
+    await conn.execute("UPDATE agents SET revoked_at=strftime('%s','now') "
+                       "WHERE household_id IS NULL AND revoked_at IS NULL")
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_enrollment_keys_household "
+        "ON agent_enrollment_keys(household_id)"
+    )
+    await conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(4,strftime('%s','now'))"
     )
 
 

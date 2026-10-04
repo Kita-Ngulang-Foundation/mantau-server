@@ -1,83 +1,145 @@
-"""Agent enrollment -- out of band, once per agent, before it can ever send
-a signed envelope. See `../../../../protocol/PROTOCOL.md`.
+"""Agent enrollment and the household's agents.
+
+A household owner or admin creates a single-use enrollment key in the app
+(`POST /enrollment-keys`) and enters it on the new agent, which presents it
+once to `POST /agents/enroll`. The agent is created inside that household and
+receives its own credential; nobody ever types or copies that credential.
 """
 
 from __future__ import annotations
 
+import json
+import time
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Depends, HTTPException, Request
+from mantau_core.contracts import AgentPlatform
 from pydantic import BaseModel, Field
 
-from ...store.agents_repo import AgentIdentityProofRequired, AgentsRepo
 from ...control_auth import authenticated_user
+from ...store.agents_repo import AgentIdTaken, AgentsRepo, EnrollmentKeyInvalid
 from ...store.control_repo import ControlRepo
 from ...store.identity_repo import UserPrincipal
 from ..deps import get_agents_repo, get_control_repo
 
-router = APIRouter(prefix="/agents", tags=["agents"])
+router = APIRouter(tags=["agents"])
+
+_MANAGERS = ("owner", "admin")
+
+
+class EnrollmentKeyOut(BaseModel):
+    key_id: str
+    enrollment_key: str  # shown exactly once
+    expires_at: datetime
+
+
+class EnrollmentKeyStatus(BaseModel):
+    key_id: str
+    status: str  # pending | used | expired | revoked
+    expires_at: datetime
+    agent_id: str | None
 
 
 class AgentEnroll(BaseModel):
+    enrollment_key: str = Field(min_length=10, max_length=64)
     agent_id: str = Field(min_length=3, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+    name: str | None = Field(default=None, min_length=1, max_length=60)
+    platform: AgentPlatform = AgentPlatform.OTHER
 
 
 class AgentEnrolled(BaseModel):
     agent_id: str
     secret: str  # shown exactly once -- there is no "show again" route
-    claim_code: str | None = None
 
 
-class AgentOut(BaseModel):
-    agent_id: str
-    enrolled_at: float
-    last_seen_at: float | None
+class AgentRename(BaseModel):
+    name: str = Field(min_length=1, max_length=60)
 
 
-@router.post("/enroll", response_model=AgentEnrolled, status_code=201)
-async def enroll(body: AgentEnroll, request: Request,
-                 repo: AgentsRepo = Depends(get_agents_repo),
-                 control: ControlRepo = Depends(get_control_repo)) -> AgentEnrolled:
-    """Initial enrollment is create-only; an existing identity is rotated only
-    with proof of its current secret (X-Mantau-Agent-ID/-Secret headers).
+def _utc(timestamp: float) -> datetime:
+    return datetime.fromtimestamp(timestamp, timezone.utc)
 
-    Without proof, an existing id answers 409 so a new device picks another
-    name; with wrong proof it answers 401. Neither changes the stored agent."""
-    proof_id = request.headers.get("X-Mantau-Agent-ID", "")
-    current_secret = request.headers.get("X-Mantau-Agent-Secret", "")
-    if proof_id != body.agent_id:
-        current_secret = ""
+
+def _require_manager(principal: UserPrincipal) -> None:
+    if principal.role not in _MANAGERS:
+        raise HTTPException(403, "forbidden")
+
+
+@router.post("/enrollment-keys", response_model=EnrollmentKeyOut, status_code=201)
+async def create_enrollment_key(request: Request, repo: AgentsRepo = Depends(get_agents_repo),
+                                principal: UserPrincipal = Depends(authenticated_user)):
+    """A single-use key that adds one agent to the caller's household."""
+    _require_manager(principal)
+    key, secret_key = await repo.create_enrollment_key(
+        principal.household_id, principal.user_id,
+        ttl_s=request.app.state.settings.enrollment_key_ttl_s,
+    )
+    return EnrollmentKeyOut(key_id=key.key_id, enrollment_key=secret_key,
+                            expires_at=_utc(key.expires_at))
+
+
+@router.get("/enrollment-keys/{key_id}", response_model=EnrollmentKeyStatus)
+async def enrollment_key_status(key_id: str, repo: AgentsRepo = Depends(get_agents_repo),
+                                principal: UserPrincipal = Depends(authenticated_user)):
+    """Polled by the app until the agent has used the key."""
+    key = await repo.get_enrollment_key(principal.household_id, key_id)
+    if key is None:
+        raise HTTPException(404, "resource_not_found")
+    return EnrollmentKeyStatus(key_id=key.key_id, status=key.status(),
+                               expires_at=_utc(key.expires_at), agent_id=key.agent_id)
+
+
+@router.delete("/enrollment-keys/{key_id}", status_code=204)
+async def revoke_enrollment_key(key_id: str, repo: AgentsRepo = Depends(get_agents_repo),
+                                principal: UserPrincipal = Depends(authenticated_user)) -> None:
+    _require_manager(principal)
+    await repo.revoke_enrollment_key(principal.household_id, key_id)
+
+
+@router.post("/agents/enroll", response_model=AgentEnrolled, status_code=201)
+async def enroll(body: AgentEnroll, repo: AgentsRepo = Depends(get_agents_repo)) -> AgentEnrolled:
+    """Consumes the enrollment key. An unknown, expired, revoked, or used key
+    answers 401 without saying which; an `agent_id` already in use answers
+    409 and leaves the key unused, so the agent can retry with another id."""
     try:
-        agent = await repo.enroll(body.agent_id, current_secret=current_secret or None)
-    except AgentIdentityProofRequired as exc:
-        if not current_secret:
-            raise HTTPException(409, "agent_id_taken") from exc
-        raise HTTPException(401, "unauthorized") from exc
-    claim_code = None
-    if agent.household_id is None:
-        claim_code = await control.create_claim_code(
-            agent.agent_id, agent.enrollment_id,
-            ttl_s=request.app.state.settings.claim_code_ttl_s,
+        agent = await repo.enroll(
+            body.enrollment_key, body.agent_id,
+            name=(body.name or body.agent_id).strip(), platform=body.platform.value,
         )
-    return AgentEnrolled(agent_id=agent.agent_id, secret=agent.secret, claim_code=claim_code)
+    except EnrollmentKeyInvalid as exc:
+        raise HTTPException(401, "invalid_enrollment_key") from exc
+    except AgentIdTaken as exc:
+        raise HTTPException(409, "agent_id_taken") from exc
+    return AgentEnrolled(agent_id=agent.agent_id, secret=agent.secret)
 
 
-@router.get("")
-async def list_agents(request: Request, repo: AgentsRepo = Depends(get_agents_repo),
-                      control: ControlRepo = Depends(get_control_repo),
+@router.get("/agents")
+async def list_agents(request: Request, control: ControlRepo = Depends(get_control_repo),
                       principal: UserPrincipal = Depends(authenticated_user)):
     return [_agent_status(row, request.app.state.settings.agent_offline_after_s)
             for row in await control.owned_agents(principal.household_id)]
 
 
+@router.patch("/agents/{agent_id}")
+async def rename_agent(agent_id: str, body: AgentRename, request: Request,
+                       repo: AgentsRepo = Depends(get_agents_repo),
+                       control: ControlRepo = Depends(get_control_repo),
+                       principal: UserPrincipal = Depends(authenticated_user)):
+    _require_manager(principal)
+    if not await repo.rename(agent_id, principal.household_id, body.name.strip()):
+        raise HTTPException(404, "resource_not_found")
+    row = await control.get_state(principal.household_id, agent_id)
+    return _agent_status(row, request.app.state.settings.agent_offline_after_s)
+
+
 def _agent_status(row, offline_after_s: int) -> dict:
-    import json
-    import time
     last_seen = row["last_seen_at"]
     online = last_seen is not None and time.time() - last_seen <= offline_after_s
     capabilities = json.loads(row["capabilities_json"]) if row["capabilities_json"] else None
     return {
         "schema_version": 1,
         "agent_id": row["agent_id"],
-        "name": row["agent_id"],
+        "name": row["name"] or row["agent_id"],
         "platform": row["platform"],
         "claim_status": "claimed",
         "setup_status": row["setup_status"] or "not_started",
@@ -92,12 +154,11 @@ def _agent_status(row, offline_after_s: int) -> dict:
     }
 
 
-@router.delete("/{agent_id}", status_code=204)
+@router.delete("/agents/{agent_id}", status_code=204)
 async def revoke(agent_id: str, repo: AgentsRepo = Depends(get_agents_repo),
                  principal: UserPrincipal = Depends(authenticated_user)) -> None:
-    """Every envelope this agent sends afterward fails verification (401) --
+    """Every request this agent makes afterward fails authentication (401) --
     there is no grace period."""
-    if principal.role not in ("owner", "admin"):
-        raise HTTPException(403, "forbidden")
+    _require_manager(principal)
     if not await repo.revoke(agent_id, principal.household_id):
         raise HTTPException(404, "resource_not_found")

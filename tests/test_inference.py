@@ -20,11 +20,10 @@ from mantau_core.activity import FrameObservation, Perception, PersonObservation
 from mantau_core.contracts import Envelope, FallEvent
 from mantau_core.contracts import inference as contract
 
-from mantau_ld.api.app import create_app
-from mantau_ld.config import Settings
+import support
 
-USER_A = {"X-Mantau-User-ID": "user-a"}
-USER_B = {"X-Mantau-User-ID": "user-b"}
+USER_A = support.user("user-a")
+USER_B = support.user("user-b")
 
 
 class FakeDetector:
@@ -68,18 +67,13 @@ def _client(**overrides) -> TestClient:
     FakeDetector.instances = []
     # Tests upload back to back; only the rate-limit test keeps a real fps cap.
     overrides.setdefault("inference_max_fps", 10_000.0)
-    settings = Settings(db_path=":memory:", control_plane_mode="local_dev", **overrides)
-    return TestClient(create_app(settings, inference_factory=FakeDetector,
-                                 inference_decoder=_decode))
+    return support.client(support.settings(**overrides), inference_factory=FakeDetector,
+                          inference_decoder=_decode)
 
 
 def _setup(client: TestClient, agent_id="agent-a", camera_id="cam-a", user=USER_A) -> str:
-    enrolled = client.post("/agents/enroll", json={"agent_id": agent_id}).json()
-    assert client.post("/agent-claims", headers=user, json={
-        "claim_code": enrolled["claim_code"], "platform": "linux_x86_64"}).status_code == 200
-    assert client.post("/cameras", headers=user, json={
-        "camera_id": camera_id, "name": "Room", "agent_id": agent_id}).status_code == 201
-    return enrolled["secret"]
+    return support.enroll(client, user, agent_id=agent_id, camera_id=camera_id,
+                          camera_name="Room")["secret"]
 
 
 def _now_ms() -> int:
@@ -131,8 +125,7 @@ def test_capability_reports_unavailable_detector_and_endpoint_refuses():
     def broken(*args):
         raise ImportError("no mantau")
 
-    app = create_app(Settings(db_path=":memory:", control_plane_mode="local_dev"),
-                     inference_factory=broken, inference_decoder=_decode)
+    app = support.app(support.settings(), inference_factory=broken, inference_decoder=_decode)
     with TestClient(app) as client:
         cap = client.get("/inference/capability").json()
         assert cap["available"] is False and "ImportError" in cap["reason"]
@@ -194,10 +187,9 @@ def test_live_frame_signature_is_not_accepted():
         assert r.status_code == 401
 
 
-def test_unclaimed_and_revoked_agents_are_refused():
+def test_unknown_and_revoked_agents_are_refused():
     with _client() as client:
-        unclaimed = client.post("/agents/enroll", json={"agent_id": "agent-u"}).json()
-        assert _upload(client, unclaimed["secret"], agent_id="agent-u",
+        assert _upload(client, "never-enrolled", agent_id="agent-u",
                        camera_id="cam-u").status_code == 401
         secret = _setup(client)
         assert client.delete("/agents/agent-a", headers=USER_A).status_code in (200, 204)
@@ -375,8 +367,7 @@ def test_real_detector_finds_a_fall_in_uploaded_frames():
     clip = Path(__file__).resolve().parents[2] / "mantau-AI" / "data" / "falls" / "video_1.mp4"
     if not clip.exists():
         pytest.skip(f"{clip} not present")
-    app = create_app(Settings(db_path=":memory:", control_plane_mode="local_dev",
-                              inference_max_fps=60))
+    app = support.app(support.settings(inference_max_fps=60))
     with TestClient(app) as client:
         secret = _setup(client)
         cap = cv2.VideoCapture(str(clip))

@@ -4,7 +4,8 @@ from mantau_core.contracts import EventKind, FallEvent, Severity
 from mantau_core.notify.channels.push.tokens import DeviceToken, Platform
 from mantau_core.notify.recipients import EmergencyContact
 
-from mantau_ld.store.agents_repo import AgentsRepo
+import support
+from mantau_ld.store.agents_repo import AgentsRepo, EnrollmentKeyInvalid
 from mantau_ld.store.cameras_repo import CamerasRepo
 from mantau_ld.store.db import Database
 from mantau_ld.store.events_repo import EventsRepo
@@ -15,23 +16,7 @@ from mantau_ld.store.token_store import SqliteTokenStore
 
 async def _owned_agent(db: Database, *, household_id: str = "household-1",
                        user_id: str = "user-1", agent_id: str = "agent-1"):
-    now = datetime.now(timezone.utc).timestamp()
-    await db.conn.execute("INSERT INTO users(user_id,created_at) VALUES(?,?)", (user_id, now))
-    await db.conn.execute(
-        "INSERT INTO households(household_id,name,created_at) VALUES(?,?,?)",
-        (household_id, "Test household", now),
-    )
-    await db.conn.execute(
-        "INSERT INTO household_memberships(household_id,user_id,role,created_at) "
-        "VALUES(?,?,'owner',?)", (household_id, user_id, now),
-    )
-    await db.conn.commit()
-    agent = await AgentsRepo(db).enroll(agent_id)
-    await db.conn.execute(
-        "UPDATE agents SET household_id=? WHERE agent_id=?", (household_id, agent_id)
-    )
-    await db.conn.commit()
-    return agent
+    return await support.enroll_in_db(db, agent_id, household_id=household_id, user_id=user_id)
 
 
 async def test_agents_repo_enroll_get_touch_revoke():
@@ -58,14 +43,28 @@ async def test_agents_repo_enroll_get_touch_revoke():
         await db.close()
 
 
-async def test_agents_repo_re_enroll_issues_a_new_secret():
+async def test_enrollment_keys_are_single_use_and_stored_hashed():
     db = Database(":memory:")
     await db.connect()
     try:
+        first = await _owned_agent(db)
+        assert first.household_id == "household-1"
         repo = AgentsRepo(db)
-        first = await repo.enroll("agent-1")
-        second = await repo.enroll("agent-1", current_secret=first.secret)
-        assert first.secret != second.secret
+        record, key = await repo.create_enrollment_key("household-1", "user-1", ttl_s=60)
+        stored = await (await db.conn.execute(
+            "SELECT key_hash FROM agent_enrollment_keys WHERE key_id=?", (record.key_id,)
+        )).fetchone()
+        assert key not in stored["key_hash"] and key.replace("-", "") not in stored["key_hash"]
+        second = await repo.enroll(key, "agent-2", name="Dapur", platform="android")
+        assert second.secret != first.secret and second.name == "Dapur"
+        try:
+            await repo.enroll(key, "agent-3", name="x", platform="android")
+        except EnrollmentKeyInvalid:
+            pass
+        else:
+            raise AssertionError("a used key enrolled another agent")
+        status = await repo.get_enrollment_key("household-1", record.key_id)
+        assert status.status() == "used" and status.agent_id == "agent-2"
     finally:
         await db.close()
 

@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import json
-import hashlib
-import secrets
 import time
 import uuid
 from dataclasses import dataclass
@@ -29,99 +27,9 @@ class IdempotencyConflict(ValueError):
     pass
 
 
-class ClaimRateLimited(PermissionError):
-    pass
-
-
 class ControlRepo:
     def __init__(self, db: Database) -> None:
         self._db = db
-
-    async def create_claim_code(
-        self, agent_id: str, enrollment_id: str, *, ttl_s: int = 600
-    ) -> str:
-        code = secrets.token_urlsafe(12).replace("-", "").replace("_", "")[:16].upper()
-        code_hash = hashlib.sha256(code.encode("ascii")).hexdigest()
-        now = time.time()
-        await self._db.conn.execute(
-            "UPDATE enrollment_claims SET expires_at=? WHERE agent_id=? AND consumed_at IS NULL",
-            (now, agent_id),
-        )
-        await self._db.conn.execute(
-            "INSERT INTO enrollment_claims(code_hash,agent_id,enrollment_id,created_at,expires_at) "
-            "VALUES(?,?,?,?,?)", (code_hash, agent_id, enrollment_id, now, now + ttl_s),
-        )
-        await self._db.conn.commit()
-        return code
-
-    async def claim(
-        self,
-        code: str,
-        *,
-        user_id: str,
-        household_id: str,
-        platform: str,
-        attempt_limit: int,
-        attempt_window_s: int,
-    ) -> str | None:
-        now = time.time()
-        code_hash = hashlib.sha256(code.encode("ascii")).hexdigest()
-        await self._db.conn.execute("BEGIN IMMEDIATE")
-        try:
-            rate = await (await self._db.conn.execute(
-                "SELECT window_started_at,attempts FROM claim_rate_limits WHERE user_id=?",
-                (user_id,),
-            )).fetchone()
-            if rate is None or now - rate["window_started_at"] >= attempt_window_s:
-                await self._db.conn.execute(
-                    "INSERT INTO claim_rate_limits(user_id,window_started_at,attempts) VALUES(?,?,1) "
-                    "ON CONFLICT(user_id) DO UPDATE SET window_started_at=excluded.window_started_at,attempts=1",
-                    (user_id, now),
-                )
-            elif rate["attempts"] >= attempt_limit:
-                await self._db.conn.rollback()
-                raise ClaimRateLimited("claim attempt limit reached")
-            else:
-                await self._db.conn.execute(
-                    "UPDATE claim_rate_limits SET attempts=attempts+1 WHERE user_id=?", (user_id,)
-                )
-            cursor = await self._db.conn.execute(
-                "SELECT c.agent_id FROM enrollment_claims c JOIN agents a ON a.agent_id=c.agent_id "
-                "WHERE c.code_hash=? AND c.consumed_at IS NULL AND c.expires_at>? "
-                "AND c.enrollment_id=a.enrollment_id AND a.household_id IS NULL AND a.revoked_at IS NULL",
-                (code_hash, now),
-            )
-            row = await cursor.fetchone()
-            if row is None:
-                await self._db.conn.commit()
-                return None
-            agent_id = row["agent_id"]
-            updated = await self._db.conn.execute(
-                "UPDATE agents SET household_id=? WHERE agent_id=? AND household_id IS NULL",
-                (household_id, agent_id),
-            )
-            if updated.rowcount != 1:
-                await self._db.conn.commit()
-                return None
-            await self._db.conn.execute(
-                "INSERT INTO agent_ownership(agent_id,owner_id,claimed_at) VALUES(?,?,?) "
-                "ON CONFLICT(agent_id) DO NOTHING", (agent_id, user_id, now),
-            )
-            await self._db.conn.execute(
-                "UPDATE enrollment_claims SET consumed_at=? WHERE code_hash=? AND consumed_at IS NULL",
-                (now, code_hash),
-            )
-            await self._db.conn.execute(
-                "INSERT INTO agent_control_state(agent_id,platform,updated_at) VALUES(?,?,?) "
-                "ON CONFLICT(agent_id) DO UPDATE SET platform=excluded.platform,updated_at=excluded.updated_at",
-                (agent_id, platform, now),
-            )
-            await self._db.conn.execute("DELETE FROM claim_rate_limits WHERE user_id=?", (user_id,))
-            await self._db.conn.commit()
-            return agent_id
-        except BaseException:
-            await self._db.conn.rollback()
-            raise
 
     async def owns(self, household_id: str, agent_id: str) -> bool:
         row = await (await self._db.conn.execute(
@@ -132,7 +40,7 @@ class ControlRepo:
 
     async def owned_agents(self, household_id: str):
         cursor = await self._db.conn.execute(
-            "SELECT a.agent_id,a.enrolled_at,a.last_seen_at,s.* FROM agents a "
+            "SELECT a.agent_id,a.name,a.enrolled_at,a.last_seen_at,s.* FROM agents a "
             "LEFT JOIN agent_control_state s ON s.agent_id=a.agent_id "
             "WHERE a.household_id=? AND a.revoked_at IS NULL ORDER BY a.enrolled_at", (household_id,)
         )
@@ -140,7 +48,7 @@ class ControlRepo:
 
     async def get_state(self, household_id: str, agent_id: str):
         cursor = await self._db.conn.execute(
-            "SELECT a.agent_id,a.last_seen_at,s.* FROM agents a "
+            "SELECT a.agent_id,a.name,a.last_seen_at,s.* FROM agents a "
             "LEFT JOIN agent_control_state s ON s.agent_id=a.agent_id "
             "WHERE a.household_id=? AND a.agent_id=? AND a.revoked_at IS NULL",
             (household_id, agent_id),

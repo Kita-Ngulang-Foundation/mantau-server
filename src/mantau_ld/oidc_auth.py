@@ -1,4 +1,5 @@
-"""OIDC JWT bearer validation without coupling app users to agent identity."""
+"""Firebase ID token (an OIDC JWT) validation, without coupling app users to
+agent identity."""
 
 from __future__ import annotations
 

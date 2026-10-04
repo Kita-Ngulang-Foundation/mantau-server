@@ -4,140 +4,50 @@ import hashlib
 import hmac
 import sqlite3
 import time
-from types import SimpleNamespace
 
-import jwt
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
 from mantau_core.contracts import Envelope, FallEvent
 
+import support
 from mantau_ld.api.app import create_app
-from mantau_ld.config import Settings
-from mantau_ld.oidc_auth import OidcAuthenticator
 
-
-ISSUER = "https://identity.example.test/"
-AUDIENCE = "mantau-app"
-PRIVATE_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-OTHER_PRIVATE_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 JPEG = b"test-jpeg"
+OTHER_PRIVATE_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
 
-class _StaticKeyClient:
-    def __init__(self, public_key) -> None:
-        self.public_key = public_key
-
-    def get_signing_key_from_jwt(self, token: str):
-        return SimpleNamespace(key=self.public_key)
-
-
-def _settings(tmp_path, **overrides) -> Settings:
-    values = dict(
-        db_path=str(tmp_path / "identity.db"),
-        control_plane_mode="production",
-        oidc_issuer=ISSUER,
-        oidc_audience=AUDIENCE,
-        oidc_jwks_url="https://identity.example.test/.well-known/jwks.json",
-        oidc_algorithms="RS256",
-        oidc_leeway_s=0,
-    )
-    values.update(overrides)
-    return Settings(**values)
-
-
-def _authenticator() -> OidcAuthenticator:
-    return OidcAuthenticator(
-        issuer=ISSUER,
-        audience=AUDIENCE,
-        jwks_url="https://identity.example.test/.well-known/jwks.json",
-        algorithms=["RS256"],
-        leeway_s=0,
-        key_client=_StaticKeyClient(PRIVATE_KEY.public_key()),
-    )
-
-
-def _token(
-    subject: str,
-    *,
-    expires_at: int | None = None,
-    issuer: str = ISSUER,
-    audience: str = AUDIENCE,
-    key=PRIVATE_KEY,
-) -> str:
-    now = int(time.time())
-    return jwt.encode(
-        {
-            "iss": issuer,
-            "aud": audience,
-            "sub": subject,
-            "iat": now,
-            "exp": expires_at if expires_at is not None else now + 300,
-        },
-        key,
-        algorithm="RS256",
-        headers={"kid": "test-key"},
-    )
-
-
-def _headers(subject: str) -> dict[str, str]:
-    return {"Authorization": f"Bearer {_token(subject)}"}
-
-
-def _enroll_claim_camera(
-    client: TestClient, headers: dict[str, str], *, agent_id: str = "agent-a",
-    camera_id: str = "camera-a",
-) -> dict:
-    enrolled = client.post("/agents/enroll", json={"agent_id": agent_id}).json()
-    assert client.post("/agent-claims", headers=headers, json={
-        "claim_code": enrolled["claim_code"], "platform": "linux",
-    }).status_code == 200
-    assert client.post("/cameras", headers=headers, json={
-        "camera_id": camera_id, "name": "Room A", "agent_id": agent_id,
-    }).status_code == 201
-    return enrolled
-
-
-def test_oidc_rejects_expired_wrong_issuer_audience_and_signature(tmp_path):
-    app = create_app(_settings(tmp_path), oidc_authenticator=_authenticator())
+def test_firebase_tokens_with_wrong_expiry_issuer_audience_or_signature_are_rejected(tmp_path):
     invalid_tokens = [
-        _token("user-a", expires_at=int(time.time()) - 60),
-        _token("user-a", issuer="https://wrong.example.test/"),
-        _token("user-a", audience="wrong-audience"),
-        _token("user-a", key=OTHER_PRIVATE_KEY),
+        support.token("user-a", expires_at=int(time.time()) - 60),
+        support.token("user-a", issuer="https://securetoken.google.com/other-project"),
+        support.token("user-a", audience="other-project"),
+        support.token("user-a", key=OTHER_PRIVATE_KEY),
     ]
-    with TestClient(app) as client:
+    with support.client(support.settings(db_path=str(tmp_path / "tokens.db"))) as client:
         for token in invalid_tokens:
             response = client.get("/agents", headers={"Authorization": f"Bearer {token}"})
             assert response.status_code == 401
             assert response.json() == {"detail": "unauthorized"}
             assert token not in response.text
+        # The old development header is not an identity.
+        assert client.get("/agents", headers={"X-Mantau-User-ID": "user-a"}).status_code == 401
 
 
-def test_production_does_not_accept_legacy_header_or_missing_oidc_configuration(tmp_path):
-    settings = Settings(db_path=str(tmp_path / "closed.db"), control_plane_mode="production")
+def test_without_a_firebase_project_user_routes_fail_closed(tmp_path):
+    settings = support.settings(db_path=str(tmp_path / "closed.db"), firebase_project_id="")
     with TestClient(create_app(settings)) as client:
-        response = client.get("/agents", headers={"X-Mantau-User-ID": "legacy-user"})
+        response = client.get("/agents", headers=support.user("user-a"))
         assert response.status_code == 503
         assert response.json() == {"detail": "authentication_unavailable"}
 
 
-def test_legacy_identity_requires_explicit_local_development_mode(tmp_path):
-    settings = Settings(
-        db_path=str(tmp_path / "local.db"), control_plane_mode="local_dev"
-    )
-    with TestClient(create_app(settings)) as client:
-        assert client.get("/agents").status_code == 401
-        assert client.get(
-            "/agents", headers={"X-Mantau-User-ID": "local-user"}
-        ).json() == []
-
-
 def test_cross_household_routes_and_notification_recipients_are_isolated(tmp_path):
-    settings = _settings(tmp_path)
-    with TestClient(create_app(settings, oidc_authenticator=_authenticator())) as client:
-        user_a = _headers("user-a")
-        user_b = _headers("user-b")
-        enrolled = _enroll_claim_camera(client, user_a)
+    settings = support.settings(db_path=str(tmp_path / "identity.db"))
+    with TestClient(support.app(settings)) as client:
+        user_a = support.user("user-a")
+        user_b = support.user("user-b")
+        enrolled = support.enroll(client, user_a, agent_id="agent-a", camera_id="camera-a",
+                                  camera_name="Room A")
 
         assert client.post("/devices/register", headers=user_a, json={
             "device_id": "device-a", "platform": "android", "token": "token-a",
@@ -213,17 +123,10 @@ def test_cross_household_routes_and_notification_recipients_are_isolated(tmp_pat
 
 
 def test_enrolled_agent_can_only_poll_and_submit_results_for_itself(tmp_path):
-    user = {"X-Mantau-User-ID": "user-a"}
-    settings = Settings(
-        db_path=str(tmp_path / "agent-scope.db"), control_plane_mode="local_dev"
-    )
-    with TestClient(create_app(settings)) as client:
-        agent_a = _enroll_claim_camera(
-            client, user, agent_id="agent-a", camera_id="camera-a"
-        )
-        agent_b = _enroll_claim_camera(
-            client, user, agent_id="agent-b", camera_id="camera-b"
-        )
+    user = support.user("user-a")
+    with support.client(support.settings(db_path=str(tmp_path / "agent-scope.db"))) as client:
+        agent_a = support.enroll(client, user, agent_id="agent-a", camera_id="camera-a")
+        agent_b = support.enroll(client, user, agent_id="agent-b", camera_id="camera-b")
         command = client.post(
             "/agents/agent-a/commands/restart",
             headers={**user, "Idempotency-Key": "agent-a-only"},
@@ -249,128 +152,58 @@ def test_enrolled_agent_can_only_poll_and_submit_results_for_itself(tmp_path):
         ).json()["command_id"] == command["command_id"]
 
 
-def test_agent_reenrollment_requires_current_identity_and_preserves_owner(tmp_path):
-    user_a = {"X-Mantau-User-ID": "user-a"}
-    user_b = {"X-Mantau-User-ID": "user-b"}
-    settings = Settings(
-        db_path=str(tmp_path / "takeover.db"), control_plane_mode="local_dev"
-    )
-    with TestClient(create_app(settings)) as client:
-        enrolled = _enroll_claim_camera(
-            client, user_a, agent_id="agent-a", camera_id="camera-a"
-        )
-        original_code = enrolled["claim_code"]
-        # Without proof an existing id is simply taken; nothing changes.
-        taken = client.post("/agents/enroll", json={"agent_id": "agent-a"})
-        assert taken.status_code == 409
-        assert taken.json() == {"detail": "agent_id_taken"}
-        wrong = client.post("/agents/enroll", json={"agent_id": "agent-a"}, headers={
-            "X-Mantau-Agent-ID": "agent-a", "X-Mantau-Agent-Secret": "wrong-secret",
-        })
-        assert wrong.status_code == 401
-        assert "wrong-secret" not in wrong.text
-
-        rotated = client.post("/agents/enroll", json={"agent_id": "agent-a"}, headers={
-            "X-Mantau-Agent-ID": "agent-a",
-            "X-Mantau-Agent-Secret": enrolled["secret"],
-        })
-        assert rotated.status_code == 201
-        assert rotated.json()["claim_code"] is None
-        assert client.get("/agents", headers=user_b).json() == []
-        assert client.post("/agent-claims", headers=user_b, json={
-            "claim_code": original_code, "platform": "linux",
-        }).status_code == 404
-        assert client.post("/agent-control/commands/poll", headers={
-            "X-Mantau-Agent-ID": "agent-a",
-            "X-Mantau-Agent-Secret": enrolled["secret"],
-        }, json={}).status_code == 401
-        assert client.post("/agent-control/commands/poll", headers={
-            "X-Mantau-Agent-ID": "agent-a",
-            "X-Mantau-Agent-Secret": rotated.json()["secret"],
-        }, json={}).status_code == 204
-
-
-def test_claims_expire_are_rate_limited_and_are_bound_to_current_enrollment(tmp_path):
-    user = {"X-Mantau-User-ID": "user-a"}
-    settings = Settings(
-        db_path=str(tmp_path / "claims.db"), control_plane_mode="local_dev",
-        claim_attempt_limit=2, claim_attempt_window_s=60,
-    )
-    with TestClient(create_app(settings)) as client:
-        first = client.post("/agents/enroll", json={"agent_id": "agent-a"}).json()
-        rotated = client.post("/agents/enroll", json={"agent_id": "agent-a"}, headers={
-            "X-Mantau-Agent-ID": "agent-a", "X-Mantau-Agent-Secret": first["secret"],
-        }).json()
-        assert client.post("/agent-claims", headers=user, json={
-            "claim_code": first["claim_code"], "platform": "linux",
-        }).status_code == 404
-        assert client.post("/agent-claims", headers=user, json={
-            "claim_code": rotated["claim_code"], "platform": "linux",
-        }).status_code == 200
-        assert client.post("/agent-claims", headers=user, json={
-            "claim_code": rotated["claim_code"], "platform": "linux",
-        }).status_code == 404
-
-    expired_settings = Settings(
-        db_path=str(tmp_path / "expired-claim.db"), control_plane_mode="local_dev",
-        claim_code_ttl_s=0,
-    )
-    with TestClient(create_app(expired_settings)) as client:
-        expired = client.post("/agents/enroll", json={"agent_id": "agent-expired"}).json()
-        assert client.post("/agent-claims", headers=user, json={
-            "claim_code": expired["claim_code"], "platform": "linux",
-        }).status_code == 404
-
-    limited_settings = Settings(
-        db_path=str(tmp_path / "limited-claim.db"), control_plane_mode="local_dev",
-        claim_attempt_limit=2, claim_attempt_window_s=60,
-    )
-    with TestClient(create_app(limited_settings)) as client:
-        for _ in range(2):
-            assert client.post("/agent-claims", headers=user, json={
-                "claim_code": "INVALID", "platform": "linux",
-            }).status_code == 404
-        assert client.post("/agent-claims", headers=user, json={
-            "claim_code": "INVALID", "platform": "linux",
-        }).status_code == 429
-
-
-def test_unclaimed_agent_refreshes_its_claim_code_without_rotating(tmp_path):
-    user = {"X-Mantau-User-ID": "user-a"}
-    settings = Settings(db_path=str(tmp_path / "refresh.db"), control_plane_mode="local_dev")
-    with TestClient(create_app(settings)) as client:
-        enrolled = client.post("/agents/enroll", json={"agent_id": "agent-r"}).json()
-        agent = {"X-Mantau-Agent-ID": "agent-r", "X-Mantau-Agent-Secret": enrolled["secret"]}
-
-        assert client.post("/agent-control/claim-code").status_code == 401
-        assert client.post("/agent-control/claim-code", headers={
-            **agent, "X-Mantau-Agent-Secret": "wrong",
+def test_expired_enrollment_keys_and_revoked_agents_are_refused(tmp_path):
+    user = support.user("user-a")
+    settings = support.settings(db_path=str(tmp_path / "keys.db"), enrollment_key_ttl_s=0)
+    with support.client(settings) as client:
+        created = client.post("/enrollment-keys", headers=user).json()
+        assert client.get(f"/enrollment-keys/{created['key_id']}",
+                          headers=user).json()["status"] == "expired"
+        assert client.post("/agents/enroll", json={
+            "enrollment_key": created["enrollment_key"], "agent_id": "agent-x",
         }).status_code == 401
 
-        fresh = client.post("/agent-control/claim-code", headers=agent)
-        assert fresh.status_code == 201
-        new_code = fresh.json()["claim_code"]
-        assert new_code != enrolled["claim_code"]
-
-        # The superseded code no longer works; the fresh one does, once.
-        assert client.post("/agent-claims", headers=user, json={
-            "claim_code": enrolled["claim_code"], "platform": "linux",
-        }).status_code == 404
-        assert client.post("/agent-claims", headers=user, json={
-            "claim_code": new_code, "platform": "linux",
-        }).status_code == 200
-
-        # The secret still works: refreshing never rotates the credential.
-        assert client.post("/agent-control/commands/poll", headers=agent,
+    with support.client(support.settings(db_path=str(tmp_path / "revoke.db"))) as client:
+        enrolled = support.enroll(client, user, agent_id="agent-r")
+        headers = support.agent_headers(enrolled)
+        assert client.post("/agent-control/commands/poll", headers=headers,
                            json={}).status_code == 204
-        # A claimed agent never receives another code.
-        again = client.post("/agent-control/claim-code", headers=agent)
-        assert again.status_code == 409
-        assert again.json() == {"detail": "agent_already_claimed"}
+        assert client.delete("/agents/agent-r", headers=user).status_code == 204
+        assert client.post("/agent-control/commands/poll", headers=headers,
+                           json={}).status_code == 401
+        # A revoked id stays taken.
+        retry = client.post("/agents/enroll", json={
+            "enrollment_key": support.enrollment_key(client, user), "agent_id": "agent-r",
+        })
+        assert retry.status_code == 409
 
 
-def test_enrollment_rejects_malformed_agent_ids(tmp_path):
-    settings = Settings(db_path=str(tmp_path / "ids.db"), control_plane_mode="local_dev")
-    with TestClient(create_app(settings)) as client:
+def test_only_owners_and_admins_create_enrollment_keys(tmp_path):
+    owner = support.user("owner")
+    member = support.user("member")
+    with support.client(support.settings(db_path=str(tmp_path / "roles.db"))) as client:
+        household = client.get("/households", headers=owner).json()[0]["household_id"]
+        invite = client.post(f"/households/{household}/invites", headers=owner,
+                             json={"role": "member"}).json()["invite_code"]
+        assert client.post("/households/join", headers=member,
+                           json={"invite_code": invite}).status_code == 200
+        as_member = {**member, "X-Mantau-Household-ID": household}
+        assert client.post("/enrollment-keys", headers=as_member).status_code == 403
+        support.enroll(client, owner, agent_id="agent-o")
+        assert client.delete("/agents/agent-o", headers=as_member).status_code == 403
+        # Members still see the household's agents.
+        assert [a["agent_id"] for a in client.get("/agents", headers=as_member).json()] == [
+            "agent-o"]
+
+
+def test_enrollment_rejects_malformed_agent_ids_and_keys(tmp_path):
+    user = support.user("user-a")
+    with support.client(support.settings(db_path=str(tmp_path / "ids.db"))) as client:
+        key = support.enrollment_key(client, user)
         for bad in ("", "a", "../etc", "agent id", "x" * 65):
-            assert client.post("/agents/enroll", json={"agent_id": bad}).status_code == 422
+            assert client.post("/agents/enroll", json={
+                "enrollment_key": key, "agent_id": bad}).status_code == 422
+        assert client.post("/agents/enroll", json={"agent_id": "agent-1"}).status_code == 422
+        assert client.post("/agents/enroll", json={
+            "enrollment_key": "MTU-ÄÄÄÄÄ-ÄÄÄÄÄ-ÄÄÄÄÄ-ÄÄÄÄÄ", "agent_id": "agent-1",
+        }).status_code == 401

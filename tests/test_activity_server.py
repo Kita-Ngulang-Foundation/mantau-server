@@ -14,11 +14,10 @@ from mantau_core.activity import FrameObservation, Perception, PersonObservation
 from mantau_core.contracts import Envelope, EventKind, FallEvent, Severity
 from mantau_core.contracts import inference as contract
 
-from mantau_ld.api.app import create_app
-from mantau_ld.config import Settings
+import support
 
-A = {"X-Mantau-User-ID": "family-a"}
-B = {"X-Mantau-User-ID": "family-b"}
+A = support.user("family-a")
+B = support.user("family-b")
 SEQ = count(1)
 SQUARE = [{"x": 0.1, "y": 0.1}, {"x": 0.4, "y": 0.1}, {"x": 0.4, "y": 0.4}, {"x": 0.1, "y": 0.4}]
 BOW_TIE = [{"x": 0.1, "y": 0.1}, {"x": 0.5, "y": 0.5}, {"x": 0.5, "y": 0.1}, {"x": 0.1, "y": 0.5}]
@@ -42,18 +41,13 @@ class LyingDetector:
 
 
 def _client(**overrides) -> TestClient:
-    settings = Settings(db_path=":memory:", control_plane_mode="local_dev", **overrides)
-    return TestClient(create_app(settings, inference_factory=LyingDetector,
-                                 inference_decoder=lambda jpeg: jpeg))
+    return support.client(support.settings(**overrides), inference_factory=LyingDetector,
+                          inference_decoder=lambda jpeg: jpeg)
 
 
 def _setup(client, agent_id, camera_id, user) -> str:
-    enrolled = client.post("/agents/enroll", json={"agent_id": agent_id}).json()
-    assert client.post("/agent-claims", headers=user, json={
-        "claim_code": enrolled["claim_code"], "platform": "linux_x86_64"}).status_code == 200
-    assert client.post("/cameras", headers=user, json={
-        "camera_id": camera_id, "name": "Kamar", "agent_id": agent_id}).status_code == 201
-    return enrolled["secret"]
+    return support.enroll(client, user, agent_id=agent_id, camera_id=camera_id,
+                          camera_name="Kamar")["secret"]
 
 
 def _settings(zones) -> dict:

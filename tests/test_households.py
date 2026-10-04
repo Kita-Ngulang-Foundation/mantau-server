@@ -25,15 +25,7 @@ class _StaticKeyClient:
 
 
 def _app(tmp_path):
-    settings = Settings(
-        db_path=str(tmp_path / "households.db"),
-        control_plane_mode="production",
-        oidc_issuer=ISSUER,
-        oidc_audience=PROJECT,
-        oidc_jwks_url=JWKS,
-        oidc_algorithms="RS256",
-        oidc_leeway_s=0,
-    )
+    settings = Settings(db_path=str(tmp_path / "households.db"), firebase_project_id=PROJECT)
     authenticator = OidcAuthenticator(
         issuer=ISSUER, audience=PROJECT, jwks_url=JWKS, algorithms=["RS256"],
         leeway_s=0, key_client=_StaticKeyClient(),

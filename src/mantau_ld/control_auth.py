@@ -1,4 +1,4 @@
-"""Separate app-user OIDC authentication from enrolled-agent authentication."""
+"""Separate app-user (Firebase) authentication from enrolled-agent authentication."""
 
 from __future__ import annotations
 
@@ -19,26 +19,15 @@ def _unauthorized() -> HTTPException:
 
 
 async def authenticated_identity(request: Request) -> OidcIdentity:
-    """The app user, before any household is chosen."""
-    settings = request.app.state.settings
-    if settings.control_plane_mode == "local_dev":
-        subject = request.headers.get("X-Mantau-User-ID", "").strip()
-        if not subject:
-            raise _unauthorized()
-        identity = OidcIdentity(issuer="local-dev", subject=subject)
-    elif settings.control_plane_mode == "production":
-        try:
-            identity = request.app.state.oidc_authenticator.authenticate(
-                request.headers.get("Authorization", "")
-            )
-        except OidcConfigurationError as exc:
-            raise HTTPException(503, "authentication_unavailable") from exc
-        except OidcTokenError as exc:
-            raise _unauthorized() from exc
-    else:
-        # Retaining the value lets older deployments fail closed rather than
-        # failing to parse configuration and silently choosing a user.
-        raise HTTPException(503, "authentication_unavailable")
+    """The app user (a Firebase ID token), before any household is chosen."""
+    try:
+        identity = request.app.state.oidc_authenticator.authenticate(
+            request.headers.get("Authorization", "")
+        )
+    except OidcConfigurationError as exc:
+        raise HTTPException(503, "authentication_unavailable") from exc
+    except OidcTokenError as exc:
+        raise _unauthorized() from exc
     await request.app.state.identity_repo.ensure_user(identity)
     return identity
 

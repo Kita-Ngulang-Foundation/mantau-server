@@ -5,7 +5,7 @@ from mantau_core.telemetry import Stage
 
 from mantau_ld.alerts.dispatcher import AlertDispatcher
 from mantau_ld.store.cameras_repo import CamerasRepo
-from mantau_ld.store.agents_repo import AgentsRepo
+import support
 from mantau_ld.store.db import Database
 from mantau_ld.store.events_repo import EventsRepo
 
@@ -35,11 +35,7 @@ async def _setup_owned_camera(db: Database, camera_id: str, name: str) -> None:
         "VALUES('household-1','user-1','owner',?)", (now,),
     )
     await db.conn.commit()
-    await AgentsRepo(db).enroll("agent-1")
-    await db.conn.execute(
-        "UPDATE agents SET household_id='household-1' WHERE agent_id='agent-1'"
-    )
-    await db.conn.commit()
+    await support.enroll_in_db(db, "agent-1")
     await CamerasRepo(db).create(
         camera_id, name, household_id="household-1", agent_id="agent-1"
     )
