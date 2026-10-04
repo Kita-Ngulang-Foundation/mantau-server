@@ -131,11 +131,14 @@ class EventsRepo:
         cursor = await self._db.conn.execute(
             "INSERT OR IGNORE INTO events(event_id,household_id,agent_id,camera_id,kind,severity,"
             "occurred_at,confidence,track_id,signals_json,zone_id,status,created_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,'needs_review',?)",
+            # created_at is the history cursor, so it must be unique per
+            # household: a coarse clock (Windows: ~15 ms) can repeat a value.
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,'needs_review',MAX(?,COALESCE("
+            "(SELECT MAX(created_at) FROM events WHERE household_id=?),0)+0.000001))",
             (event.event_id, household_id, agent_id, event.camera_id,
              event.kind.value, event.severity.value,
              event.occurred_at.isoformat(), event.confidence, event.track_id,
-             json.dumps(event.signals), event.zone_id, time.time()),
+             json.dumps(event.signals), event.zone_id, time.time(), household_id),
         )
         await self._db.conn.commit()
         return cursor.rowcount > 0

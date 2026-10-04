@@ -12,18 +12,15 @@ import hmac
 
 from fastapi.testclient import TestClient
 
-from mantau_ld.api.app import create_app
-from mantau_ld.config import Settings
+import support
 from mantau_ld.frames import FrameStore
 
 JPEG = b"\xff\xd8\xff\xe0not-a-real-jpeg-but-opaque-bytes\xff\xd9"
-USER = {"X-Mantau-User-ID": "user-a"}
+USER = support.user("user-a")
 
 
 def _client() -> TestClient:
-    return TestClient(create_app(Settings(
-        db_path=":memory:", control_plane_mode="local_dev"
-    )))
+    return support.client()
 
 
 def _sign(secret: str, camera_id: str, body: bytes) -> str:
@@ -33,14 +30,8 @@ def _sign(secret: str, camera_id: str, body: bytes) -> str:
 
 
 def _enroll(client: TestClient, agent_id: str = "agent-1") -> str:
-    enrolled = client.post("/agents/enroll", json={"agent_id": agent_id}).json()
-    assert client.post("/agent-claims", headers=USER, json={
-        "claim_code": enrolled["claim_code"], "platform": "linux",
-    }).status_code == 200
-    assert client.post("/cameras", headers=USER, json={
-        "camera_id": "cam-1", "name": "Room", "agent_id": agent_id,
-    }).status_code == 201
-    return enrolled["secret"]
+    return support.enroll(client, USER, agent_id=agent_id, camera_id="cam-1",
+                          camera_name="Room")["secret"]
 
 
 def _push(client: TestClient, secret: str, *, camera_id="cam-1", agent_id="agent-1", body=JPEG):
@@ -135,3 +126,24 @@ def test_signature_is_bound_to_the_camera_it_was_signed_for():
             },
         )
         assert r.status_code == 401
+
+
+def test_upload_reports_whether_anyone_is_watching():
+    with _client() as client:
+        secret = _enroll(client)
+        first = _push(client, secret)
+        assert first.status_code == 204
+        assert first.headers["X-Mantau-Live-Viewers"] == "0"
+        # A snapshot fetch counts as a viewer for a few seconds.
+        assert client.get("/cameras/cam-1/snapshot.jpg", headers=USER).status_code == 200
+        assert _push(client, secret).headers["X-Mantau-Live-Viewers"] == "1"
+
+
+def test_open_streams_count_as_viewers_until_closed():
+    store = FrameStore(snapshot_viewer_s=0)
+    assert store.viewers("cam-1") == 0
+    with store.watching("cam-1"):
+        with store.watching("cam-1"):
+            assert store.viewers("cam-1") == 2
+        assert store.viewers("cam-1") == 1
+    assert store.viewers("cam-1") == 0

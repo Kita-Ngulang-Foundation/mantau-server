@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 
@@ -34,10 +35,34 @@ class FrameStore:
     waiter once, then a fresh Event is installed for the following frame.
     """
 
-    def __init__(self, *, stale_after_s: float = 15.0) -> None:
+    def __init__(self, *, stale_after_s: float = 15.0, snapshot_viewer_s: float = 5.0) -> None:
         self._frames: dict[str, Frame] = {}
         self._waiters: dict[str, asyncio.Event] = {}
         self._stale_after_s = stale_after_s
+        self._streams: dict[str, int] = {}
+        self._snapshot_at: dict[str, float] = {}
+        self._snapshot_viewer_s = snapshot_viewer_s
+
+    @contextmanager
+    def watching(self, camera_id: str):
+        """An open live stream; agents upload at video rate while any exist."""
+        self._streams[camera_id] = self._streams.get(camera_id, 0) + 1
+        try:
+            yield
+        finally:
+            remaining = self._streams.get(camera_id, 1) - 1
+            if remaining > 0:
+                self._streams[camera_id] = remaining
+            else:
+                self._streams.pop(camera_id, None)
+
+    def snapshot_requested(self, camera_id: str) -> None:
+        self._snapshot_at[camera_id] = time.monotonic()
+
+    def viewers(self, camera_id: str) -> int:
+        """Open streams, plus one for a snapshot fetched in the last few seconds."""
+        recent = time.monotonic() - self._snapshot_at.get(camera_id, float("-inf"))
+        return self._streams.get(camera_id, 0) + (1 if recent <= self._snapshot_viewer_s else 0)
 
     def put(self, camera_id: str, jpeg: bytes, *, household_id: str, agent_id: str) -> None:
         self._frames[camera_id] = Frame(

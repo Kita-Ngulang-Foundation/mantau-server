@@ -64,7 +64,10 @@ async def push_frame(
     frames.put(
         camera_id, body, household_id=agent.household_id, agent_id=x_mantau_agent
     )
-    return Response(status_code=204)
+    # Tells the agent whether anyone is watching, so it sends video-rate
+    # frames only while a family member has the live view open.
+    return Response(status_code=204,
+                    headers={"X-Mantau-Live-Viewers": str(frames.viewers(camera_id))})
 
 
 @router.get("/cameras/{camera_id}/snapshot.jpg")
@@ -76,6 +79,7 @@ async def snapshot(
 ) -> Response:
     if await cameras.get_for_household(principal.household_id, camera_id) is None:
         raise HTTPException(404, "resource_not_found")
+    frames.snapshot_requested(camera_id)
     frame = frames.latest(camera_id, household_id=principal.household_id)
     if frame is None:
         raise HTTPException(404, "resource_not_found")
@@ -99,6 +103,11 @@ async def live(
         raise HTTPException(404, "resource_not_found")
 
     async def stream():
+        with frames.watching(camera_id):
+            async for part in _parts():
+                yield part
+
+    async def _parts():
         # Start from whatever is already current: a viewer opening a stream on
         # a live camera must not stare at nothing until the next push happens.
         current = frames.latest(camera_id, household_id=principal.household_id)
