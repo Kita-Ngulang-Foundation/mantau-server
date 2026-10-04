@@ -147,3 +147,13 @@ def test_open_streams_count_as_viewers_until_closed():
             assert store.viewers("cam-1") == 2
         assert store.viewers("cam-1") == 1
     assert store.viewers("cam-1") == 0
+
+
+def test_a_frame_that_overtook_a_newer_one_is_dropped():
+    store = FrameStore()
+    assert store.put("cam-1", b"b", household_id="h", agent_id="a", captured_at_ms=100_000)
+    assert not store.put("cam-1", b"a", household_id="h", agent_id="a", captured_at_ms=99_500)
+    assert store.latest("cam-1").jpeg == b"b"
+    # A much older time means the agent restarted: shown, not dropped.
+    assert store.put("cam-1", b"c", household_id="h", agent_id="a", captured_at_ms=10)
+    assert store.put("cam-1", b"d", household_id="h", agent_id="a")

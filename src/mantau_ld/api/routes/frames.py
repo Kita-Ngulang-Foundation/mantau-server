@@ -51,6 +51,7 @@ async def push_frame(
     request: Request,
     x_mantau_agent: str = Header(...),
     x_mantau_signature: str = Header(...),
+    x_mantau_captured_at: int | None = Header(None),
     agents: AgentsRepo = Depends(get_agents_repo),
     cameras: CamerasRepo = Depends(get_cameras_repo),
     frames: FrameStore = Depends(get_frames),
@@ -62,7 +63,8 @@ async def push_frame(
     if agent is None or camera is None or agent.household_id is None:
         raise HTTPException(401, "unauthorized")
     frames.put(
-        camera_id, body, household_id=agent.household_id, agent_id=x_mantau_agent
+        camera_id, body, household_id=agent.household_id, agent_id=x_mantau_agent,
+        captured_at_ms=x_mantau_captured_at,
     )
     # Tells the agent whether anyone is watching, so it sends video-rate
     # frames only while a family member has the live view open.

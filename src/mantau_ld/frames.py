@@ -18,6 +18,9 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 
 
+_REORDER_WINDOW_MS = 5_000
+
+
 @dataclass(frozen=True)
 class Frame:
     jpeg: bytes
@@ -25,6 +28,7 @@ class Frame:
     household_id: str
     agent_id: str
     camera_id: str
+    captured_at_ms: int | None = None
 
 
 class FrameStore:
@@ -64,14 +68,26 @@ class FrameStore:
         recent = time.monotonic() - self._snapshot_at.get(camera_id, float("-inf"))
         return self._streams.get(camera_id, 0) + (1 if recent <= self._snapshot_viewer_s else 0)
 
-    def put(self, camera_id: str, jpeg: bytes, *, household_id: str, agent_id: str) -> None:
+    def put(self, camera_id: str, jpeg: bytes, *, household_id: str, agent_id: str,
+            captured_at_ms: int | None = None) -> bool:
+        """Stores the frame unless a newer one from the same agent is already
+        current (agents upload several frames at once). False when dropped."""
+        current = self._frames.get(camera_id)
+        if (captured_at_ms is not None and current is not None
+                and current.agent_id == agent_id and current.captured_at_ms is not None
+                # Only a short reorder window: a much older time means the
+                # agent's clock or stream restarted, and the frame is new.
+                and current.captured_at_ms - _REORDER_WINDOW_MS
+                < captured_at_ms <= current.captured_at_ms):
+            return False
         self._frames[camera_id] = Frame(
             jpeg=jpeg, received_at=time.monotonic(), household_id=household_id,
-            agent_id=agent_id, camera_id=camera_id,
+            agent_id=agent_id, camera_id=camera_id, captured_at_ms=captured_at_ms,
         )
         waiter = self._waiters.pop(camera_id, None)
         if waiter is not None:
             waiter.set()
+        return True
 
     def latest(self, camera_id: str, *, household_id: str | None = None) -> Frame | None:
         frame = self._frames.get(camera_id)
