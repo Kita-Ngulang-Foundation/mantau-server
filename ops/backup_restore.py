@@ -63,6 +63,10 @@ def backup(database: Path, recordings: Path, target: Path, *, source_id: str) ->
         with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as source:
             with closing(sqlite3.connect(staging / 'mantau_ld.db')) as output:
                 source.backup(output)
+                # SQLite backup copies the source journal header. Make only
+                # the snapshot self-contained before validation opens it.
+                if output.execute('PRAGMA journal_mode=DELETE').fetchone()[0] != 'delete':
+                    raise ValueError('Backup database journal conversion failed')
         validate_database(staging / 'mantau_ld.db')
         (staging / 'recordings').mkdir()
         for path in sorted(recordings.rglob('*')):
