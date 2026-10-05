@@ -4,6 +4,8 @@ import hashlib
 import hmac
 import sqlite3
 import time
+import pytest
+from types import SimpleNamespace
 
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
@@ -11,6 +13,8 @@ from mantau_core.contracts import Envelope, FallEvent
 
 import support
 from mantau_ld.api.app import create_app
+from test_data_lifecycle import _api_headers, _api_query, _delete_api_profile, _delete_personal_household
+import mantau_ld.store.lifecycle_repo as lifecycle_module
 
 JPEG = b"test-jpeg"
 OTHER_PRIVATE_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -113,7 +117,7 @@ def test_cross_household_routes_and_notification_recipients_are_isolated(tmp_pat
         assert client.delete("/devices/device-a", headers=user_b).status_code == 204
         assert client.post("/devices/register", headers=user_b, json={
             "device_id": "device-a", "platform": "android", "token": "replacement",
-        }).status_code == 204
+        }).status_code == 409
         recipients = client.app.state.resolver.devices_for_camera("camera-a")
         assert [token.token for token in recipients] == ["token-a"]
         with sqlite3.connect(tmp_path / "identity.db") as db:
@@ -207,3 +211,56 @@ def test_enrollment_rejects_malformed_agent_ids_and_keys(tmp_path):
         assert client.post("/agents/enroll", json={
             "enrollment_key": "MTU-ÄÄÄÄÄ-ÄÄÄÄÄ-ÄÄÄÄÄ-ÄÄÄÄÄ", "agent_id": "agent-1",
         }).status_code == 401
+
+
+@pytest.mark.parametrize("authentication", ["older", "equal", "missing"])
+def test_deleted_account_jwt_cannot_reprovision_a_profile_after_restart(tmp_path, monkeypatch, authentication):
+    deleted_at = int(time.time()) - 5
+    monkeypatch.setattr(lifecycle_module, "time", SimpleNamespace(time=lambda: deleted_at))
+    old = _api_headers("deleted-auth-user", deleted_at - 1)
+    settings = support.settings(db_path=str(tmp_path / "deleted-auth.db"), inference_enabled=False)
+    with support.client(settings) as client:
+        _delete_api_profile(client, old)
+        assert _api_query(client, "SELECT * FROM users") == []
+        assert client.delete("/devices/old-phone", headers=old).status_code == 401
+        assert client.delete("/households/account/me", headers=old).status_code == 401
+        assert _api_query(client, "SELECT * FROM users") == []
+    auth_time = None if authentication == "missing" else deleted_at if authentication == "equal" else deleted_at - 1
+    stale = _api_headers("deleted-auth-user", auth_time)
+    with support.client(settings) as client:
+        for path in ("/households", "/agents", "/cameras"):
+            assert client.get(path, headers=stale).status_code == 401
+        assert _api_query(client, "SELECT * FROM users") == []
+        assert len(_api_query(client, "SELECT * FROM account_deletions")) == 1
+
+
+def test_fresh_interactive_authentication_can_create_new_account_and_old_cleanup_cannot_affect_it(tmp_path, monkeypatch):
+    deleted_at = int(time.time()) - 5
+    monkeypatch.setattr(lifecycle_module, "time", SimpleNamespace(time=lambda: deleted_at))
+    old = _api_headers("recreated-auth-user", deleted_at - 1)
+    fresh = _api_headers("recreated-auth-user", deleted_at + 1)
+    with support.client(support.settings(db_path=str(tmp_path / "recreated-auth.db"),
+                                         inference_enabled=False)) as client:
+        _delete_api_profile(client, old)
+        families = client.get("/households", headers=fresh)
+        assert families.status_code == 200 and len(families.json()) == 1
+        support.register_device(client, fresh, device_id="recreated-phone", token="fresh-token")
+        # A logout cleanup queued before deletion cannot unregister a later account.
+        assert client.delete("/devices/recreated-phone", headers=old).status_code == 401
+        assert _api_query(client, "SELECT token FROM device_tokens") == [{"token": "fresh-token"}]
+        new_user = _api_query(client, "SELECT user_id FROM users")[0]["user_id"]
+        household = families.json()[0]["household_id"]
+        _delete_personal_household(client, fresh, household)
+        # Removing its empty personal household makes deletion possible; stale
+        # account cleanup must still leave the new profile intact.
+        assert client.delete("/households/account/me", headers=old).status_code == 401
+        assert _api_query(client, "SELECT user_id FROM users") == [{"user_id": new_user}]
+
+
+@pytest.mark.parametrize("authenticated_at", [-1, True, "123", float("nan"), float("inf"), time.time() + 3600])
+def test_invalid_authentication_time_is_rejected_without_provisioning(tmp_path, authenticated_at):
+    with support.client(support.settings(db_path=str(tmp_path / "invalid-auth-time.db"),
+                                         inference_enabled=False)) as client:
+        response = client.get("/households", headers=_api_headers("invalid-auth-time", authenticated_at))
+        assert response.status_code == 401
+        assert _api_query(client, "SELECT * FROM users") == []

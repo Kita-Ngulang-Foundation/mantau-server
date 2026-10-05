@@ -22,7 +22,7 @@ class Settings(CoreSettings):
     control_plane_encryption_key: str = ""
     command_ttl_s: int = 300
     command_delivery_lease_s: int = 30
-    agent_offline_after_s: int = 120
+    agent_offline_after_s: int = 30
     # Single-use keys a household owner/admin creates in the app and enters on
     # a new agent. Only their SHA-256 is stored.
     enrollment_key_ttl_s: int = 3600
@@ -30,7 +30,11 @@ class Settings(CoreSettings):
     # Event clips uploaded by agents. Keep on a persistent volume.
     recordings_dir: str = "data/recordings"
     recording_max_bytes: int = 20 * 1024 * 1024
+    recording_household_max_bytes: int = 1024 * 1024 * 1024
+    recording_global_max_bytes: int = 5 * 1024 * 1024 * 1024
     recording_retention_days: int = 30
+    event_retention_days: int = 30
+    maintenance_interval_s: float = 3600.0
     frame_max_bytes: int = 2 * 1024 * 1024
 
     # Server inference (POST /agents/{id}/inference): agents without a usable

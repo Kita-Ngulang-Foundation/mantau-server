@@ -168,7 +168,7 @@ exercising the full ingest -> dispatch -> event path together.
   out-of-order envelope and flags it; it does not hold it back to restore
   strict per-agent sequence. See that module's docstring for what a reorder
   buffer would need.
-- **No clip generation.**
+- Native agents generate bounded event clips; this server admits, stores and serves them under household authorization.
 - **Agent secrets are stored in plain SQLite columns**, same simplification
   as mantau-backend-rtsp's camera passwords.
 - **Docker Compose is unverified end-to-end** (`../docker/compose.yaml`) --
@@ -189,7 +189,12 @@ For a Railway Hobby deployment with server inference, build a wheel from the
 this repository's `main` commit. Set Railway's `MANTAU_REQUIRE_DETECTOR=1`
 variable and upload that archive with `railway up --no-gitignore`.
 `private-deps/` is Git-ignored; do not add the wheel to the repository. The
-Dockerfile checks for it and fails the build if it is required but absent.
+Dockerfile checks the wheel SHA-256 manifest and fails when the required wheel is absent.
 This uses Railway's source upload and needs no private image registry or
 GitHub token in Railway. A GitHub-only build without the wheel will fail while
 the requirement is enabled; repeat the clean archive upload for each release.
+
+See [OPERATIONS.md](OPERATIONS.md) for single-process limits, persistent storage,
+retention, household/account lifecycle, diagnostics and isolated backup/restore.
+Integration branches are validation candidates. Main/deployment promotion stays
+gated on exact builds, signed upgrade and staging/physical acceptance evidence.

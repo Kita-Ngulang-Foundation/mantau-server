@@ -23,17 +23,18 @@ class SqliteTokenStore:
         if not token.user_id or not token.household_id:
             raise ValueError("owned device token required")
         with self._db.lock:
-            self._db.conn.execute(
+            cursor = self._db.conn.execute(
                 "INSERT INTO device_tokens(device_id,user_id,household_id,platform,token,registered_at,last_seen_at) "
                 "VALUES(?,?,?,?,?,?,?) "
                 "ON CONFLICT(device_id) DO UPDATE SET platform=excluded.platform, "
-                "token=excluded.token,last_seen_at=excluded.last_seen_at "
-                "WHERE device_tokens.user_id=excluded.user_id "
-                "AND device_tokens.household_id=excluded.household_id",
+                "token=excluded.token,last_seen_at=excluded.last_seen_at,household_id=excluded.household_id "
+                "WHERE device_tokens.user_id=excluded.user_id",
                 (token.device_id, token.user_id, token.household_id, token.platform.value, token.token,
                  token.registered_at.isoformat(), token.last_seen_at.isoformat()),
             )
             self._db.conn.commit()
+            if cursor.rowcount != 1:
+                raise ValueError('device ownership conflict')
 
     def tokens_for_camera(self, camera_id: str) -> list[DeviceToken]:
         with self._db.lock:
@@ -69,7 +70,7 @@ class SqliteTokenStore:
     def delete_owned(self, device_id: str, *, user_id: str, household_id: str) -> None:
         with self._db.lock:
             self._db.conn.execute(
-                "DELETE FROM device_tokens WHERE device_id=? AND user_id=? AND household_id=?",
-                (device_id, user_id, household_id),
+                "DELETE FROM device_tokens WHERE device_id=? AND user_id=?",
+                (device_id, user_id),
             )
             self._db.conn.commit()

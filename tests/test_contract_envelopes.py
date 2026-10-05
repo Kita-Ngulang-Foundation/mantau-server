@@ -1,5 +1,5 @@
 """The "server accepts" half of the wire contract: an envelope shaped
-exactly like `../../protocol/examples/fall_event_envelope.json` (same field
+exactly like `protocol/examples/fall_event_envelope.json` (same field
 names, same payload shape, same signing scheme) must be accepted by a real
 enrolled agent's `/ingest` call.
 
@@ -24,7 +24,7 @@ from mantau_core.contracts import Envelope, EventKind, FallEvent, Heartbeat, Sev
 
 import support
 
-EXAMPLES_DIR = Path(__file__).resolve().parents[2] / "protocol" / "examples"
+EXAMPLES_DIR = Path(__file__).resolve().parents[1] / "protocol" / "examples"
 FIXED_TIME = datetime(2026, 9, 13, 4, 12, 3, 114000, tzinfo=timezone.utc)
 USER = support.user("fixture-user")
 

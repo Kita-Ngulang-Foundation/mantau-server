@@ -14,6 +14,7 @@ import uuid
 from dataclasses import dataclass
 
 from .db import Database
+from .transactions import serialized_repository
 
 # Crockford base32: no I, L, O, U, so a key read aloud or retyped is unambiguous.
 _ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
@@ -78,6 +79,7 @@ def _format_key(body: str) -> str:
     return "-".join([KEY_PREFIX, *(body[i:i + 5] for i in range(0, len(body), 5))])
 
 
+@serialized_repository
 class AgentsRepo:
     def __init__(self, db: Database) -> None:
         self._db = db

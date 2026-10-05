@@ -91,9 +91,18 @@ class FrameStore:
 
     def latest(self, camera_id: str, *, household_id: str | None = None) -> Frame | None:
         frame = self._frames.get(camera_id)
+        if frame is not None and time.monotonic() - frame.received_at > self._stale_after_s:
+            return None
         if frame is not None and household_id is not None and frame.household_id != household_id:
             return None
         return frame
+
+    def forget(self, camera_id):
+        self._frames.pop(camera_id, None)
+        self._snapshot_at.pop(camera_id, None)
+        waiter = self._waiters.pop(camera_id, None)
+        if waiter:
+            waiter.set()
 
     def is_live(self, camera_id: str) -> bool:
         frame = self._frames.get(camera_id)

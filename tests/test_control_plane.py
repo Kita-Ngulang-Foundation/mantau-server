@@ -54,13 +54,13 @@ def test_command_retry_delivery_restart_and_agent_return(tmp_path):
                                headers={**USER, "Idempotency-Key": "restart-once"})
         assert conflict.status_code == 409
 
-        # It starts offline, then authenticated polling marks it online.
+        # Contact alone proves connection; protection needs processed frames.
         assert client.get("/agents", headers=USER).json()[0]["health_state"] == "offline"
         polled = client.post("/agent-control/commands/poll", headers=_agent_headers(enrolled),
                              json={"status": {"health_state": "online"}})
         assert polled.status_code == 200
         assert polled.json()["command_type"] == "restart"
-        assert client.get("/agents", headers=USER).json()[0]["health_state"] == "online"
+        assert client.get("/agents", headers=USER).json()[0]["health_state"] == "degraded"
 
         command_id = polled.json()["command_id"]
         result = {"schema_version": 1, "command_id": command_id, "state": "succeeded",

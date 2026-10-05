@@ -136,21 +136,28 @@ def _agent_status(row, offline_after_s: int) -> dict:
     last_seen = row["last_seen_at"]
     online = last_seen is not None and time.time() - last_seen <= offline_after_s
     capabilities = json.loads(row["capabilities_json"]) if row["capabilities_json"] else None
+    frame_at = row["last_frame_at"]
+    inference_at = row["last_inference_at"]
+    protected = (online and frame_at is not None and inference_at is not None
+                 and time.time()-min(frame_at,inference_at) <= 15)
     return {
         "schema_version": 1,
         "agent_id": row["agent_id"],
         "name": row["name"] or row["agent_id"],
         "platform": row["platform"],
         "claim_status": "claimed",
-        "setup_status": row["setup_status"] or "not_started",
-        "health_state": (row["health_state"] or "online") if online else "offline",
+        "setup_status": "active" if protected else ("waiting_for_agent" if row["setup_status"] == "active" else row["setup_status"] or "not_started"),
+        "health_state": "offline" if not online else "online" if protected else "degraded",
         "requested_inference_mode": row["requested_inference_mode"],
         "effective_inference_mode": row["effective_inference_mode"],
         "capabilities": capabilities,
         "camera_connectivity": row["camera_connectivity"] or "unknown",
         "last_heartbeat_at": last_seen,
-        "last_frame_at": None,
-        "health_explanation": row["health_explanation"] if online else "Agent heartbeat is stale",
+        "last_frame_at": frame_at,
+        "last_inference_at": inference_at,
+        "last_server_contact_at": last_seen,
+        "health_explanation": ("Agent heartbeat is stale" if not online else None if protected
+                               else "Waiting for fresh successfully processed camera frames"),
     }
 
 

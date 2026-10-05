@@ -1,0 +1,15 @@
+{
+  "agent_id": "agent-3f9a1c2b",
+  "seq": 43,
+  "sent_at": "2026-09-13T04:12:03.114000Z",
+  "kind": "heartbeat",
+  "payload": {
+    "agent_id": "agent-3f9a1c2b",
+    "camera_id": "cam-kamar-ibu",
+    "sent_at": "2026-09-13T04:12:03.114000Z",
+    "camera_reachable": true,
+    "detector_alive": true,
+    "queue_depth": 0
+  },
+  "sig": "70783544d06a353b8ecd7699a706371fc680eb401fe4e9a3dd9ac5c55f9c4efe"
+}

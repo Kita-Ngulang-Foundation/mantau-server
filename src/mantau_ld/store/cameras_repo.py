@@ -13,6 +13,7 @@ import time
 from dataclasses import dataclass
 
 from .db import Database
+from .transactions import serialized_repository
 
 
 @dataclass
@@ -23,6 +24,7 @@ class CameraInfo:
     agent_id: str | None
 
 
+@serialized_repository
 class CamerasRepo:
     def __init__(self, db: Database) -> None:
         self._db = db
@@ -40,11 +42,11 @@ class CamerasRepo:
         await self._db.conn.execute(
             "INSERT INTO cameras(camera_id,name,household_id,agent_id,registered_at) VALUES(?,?,?,?,?) "
             "ON CONFLICT(camera_id) DO UPDATE SET name=excluded.name,agent_id=excluded.agent_id "
-            "WHERE cameras.household_id=excluded.household_id",
+            "WHERE cameras.household_id=excluded.household_id AND cameras.revoked_at IS NULL",
             (camera_id, name, household_id, agent_id, time.time()),
         )
         row = await (await self._db.conn.execute(
-            "SELECT * FROM cameras WHERE camera_id=? AND household_id=?", (camera_id, household_id)
+            "SELECT * FROM cameras WHERE camera_id=? AND household_id=? AND revoked_at IS NULL", (camera_id, household_id)
         )).fetchone()
         if row is None:
             await self._db.conn.rollback()
@@ -54,7 +56,7 @@ class CamerasRepo:
 
     async def get(self, camera_id: str) -> CameraInfo | None:
         cursor = await self._db.conn.execute(
-            "SELECT * FROM cameras WHERE camera_id = ?", (camera_id,)
+            "SELECT * FROM cameras WHERE revoked_at IS NULL AND camera_id = ?", (camera_id,)
         )
         row = await cursor.fetchone()
         if row is None:
@@ -63,7 +65,7 @@ class CamerasRepo:
 
     async def get_for_household(self, household_id: str, camera_id: str) -> CameraInfo | None:
         row = await (await self._db.conn.execute(
-            "SELECT * FROM cameras WHERE household_id=? AND camera_id=?",
+            "SELECT * FROM cameras WHERE revoked_at IS NULL AND household_id=? AND camera_id=?",
             (household_id, camera_id),
         )).fetchone()
         return self._row(row) if row else None
@@ -72,18 +74,18 @@ class CamerasRepo:
         row = await (await self._db.conn.execute(
             "SELECT c.* FROM cameras c JOIN agents a ON a.agent_id=c.agent_id "
             "WHERE c.camera_id=? AND c.agent_id=? AND c.household_id=a.household_id "
-            "AND a.revoked_at IS NULL", (camera_id, agent_id),
+            "AND a.revoked_at IS NULL AND c.revoked_at IS NULL", (camera_id, agent_id),
         )).fetchone()
         return self._row(row) if row else None
 
     async def list_all(self) -> list[CameraInfo]:
-        cursor = await self._db.conn.execute("SELECT * FROM cameras ORDER BY registered_at ASC")
+        cursor = await self._db.conn.execute("SELECT * FROM cameras WHERE revoked_at IS NULL ORDER BY registered_at ASC")
         rows = await cursor.fetchall()
         return [self._row(row) for row in rows]
 
     async def list_for_household(self, household_id: str) -> list[CameraInfo]:
         rows = await (await self._db.conn.execute(
-            "SELECT * FROM cameras WHERE household_id=? ORDER BY registered_at", (household_id,)
+            "SELECT * FROM cameras WHERE revoked_at IS NULL AND household_id=? ORDER BY registered_at", (household_id,)
         )).fetchall()
         return [self._row(row) for row in rows]
 
@@ -95,7 +97,7 @@ class CamerasRepo:
 
     async def delete(self, household_id: str, camera_id: str) -> bool:
         cursor = await self._db.conn.execute(
-            "DELETE FROM cameras WHERE household_id=? AND camera_id=?", (household_id, camera_id)
+            "UPDATE cameras SET revoked_at=strftime('%s','now') WHERE revoked_at IS NULL AND household_id=? AND camera_id=?", (household_id, camera_id)
         )
         await self._db.conn.commit()
         return cursor.rowcount > 0

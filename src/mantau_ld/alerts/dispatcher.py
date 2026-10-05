@@ -19,6 +19,7 @@ from mantau_core.telemetry import LatencyTrace, Stage
 
 from ..store.cameras_repo import CamerasRepo
 from ..store.events_repo import EventsRepo
+from .outbox import PushOutbox
 
 
 class AlertDispatcher:
@@ -29,17 +30,21 @@ class AlertDispatcher:
         # Short-lived, in-process -- matches mantau_core's own weekend-scope
         # choice for AckService and mantau-backend-rtsp's dispatcher.
         self.traces: dict[str, LatencyTrace] = {}
+        self.outbox = PushOutbox(events_repo, cameras_repo, fanout)
+        self.outbox.trace_for = self.get_trace
 
-    async def dispatch(self, event: FallEvent, *, household_id: str, agent_id: str) -> None:
-        trace = LatencyTrace(event.event_id)
-        trace.stamp(Stage.CAPTURED, at=event.occurred_at.timestamp())
-        trace.stamp(Stage.DETECTED, at=event.occurred_at.timestamp())
-        self.traces[event.event_id] = trace
+    async def dispatch(self, event: FallEvent, *, household_id: str, agent_id: str, deliver: bool = True) -> None:
+        if event.event_id not in self.traces:
+            trace = LatencyTrace(event.event_id)
+            trace.stamp(Stage.CAPTURED, at=event.occurred_at.timestamp())
+            trace.stamp(Stage.DETECTED, at=event.occurred_at.timestamp())
+            self.traces[event.event_id] = trace
 
-        if not await self.events_repo.insert(event, household_id=household_id, agent_id=agent_id):
-            return  # already stored and alerted: a duplicate delivery never alerts twice
-        camera_name = await self.cameras_repo.name_for(event.camera_id, household_id)
-        await self.fanout.send(event, camera_name=camera_name, trace=trace)
+        await self.outbox.enqueue(event, household_id, agent_id)
+        if deliver:
+            await self.outbox.deliver_pending()
+        if len(self.traces) > 1000:
+            self.traces.pop(next(iter(self.traces)))
 
     def get_trace(self, event_id: str) -> LatencyTrace | None:
         return self.traces.get(event_id)

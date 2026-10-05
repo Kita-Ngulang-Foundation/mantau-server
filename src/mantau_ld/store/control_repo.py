@@ -9,6 +9,7 @@ from mantau_core.contracts import CommandResult, CommandState, CommandType
 
 from ..control_crypto import CredentialCipher
 from .db import Database
+from .transactions import serialized_repository
 
 
 @dataclass
@@ -27,6 +28,7 @@ class IdempotencyConflict(ValueError):
     pass
 
 
+@serialized_repository
 class ControlRepo:
     def __init__(self, db: Database) -> None:
         self._db = db
@@ -40,7 +42,7 @@ class ControlRepo:
 
     async def owned_agents(self, household_id: str):
         cursor = await self._db.conn.execute(
-            "SELECT a.agent_id,a.name,a.enrolled_at,a.last_seen_at,s.* FROM agents a "
+            "SELECT a.agent_id,a.name,a.enrolled_at,a.last_seen_at,a.last_frame_at,a.last_inference_at,s.* FROM agents a "
             "LEFT JOIN agent_control_state s ON s.agent_id=a.agent_id "
             "WHERE a.household_id=? AND a.revoked_at IS NULL ORDER BY a.enrolled_at", (household_id,)
         )
@@ -48,7 +50,7 @@ class ControlRepo:
 
     async def get_state(self, household_id: str, agent_id: str):
         cursor = await self._db.conn.execute(
-            "SELECT a.agent_id,a.name,a.last_seen_at,s.* FROM agents a "
+            "SELECT a.agent_id,a.name,a.last_seen_at,a.last_frame_at,a.last_inference_at,s.* FROM agents a "
             "LEFT JOIN agent_control_state s ON s.agent_id=a.agent_id "
             "WHERE a.household_id=? AND a.agent_id=? AND a.revoked_at IS NULL",
             (household_id, agent_id),

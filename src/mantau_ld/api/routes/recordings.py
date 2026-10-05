@@ -18,6 +18,7 @@ from mantau_core.contracts import EventKind
 from ...control_auth import authenticated_user
 from ...store.agents_repo import AgentsRepo
 from ...store.events_repo import EventsRepo
+from ...store.recordings_repo import RecordingsCapacityExceeded
 from ...store.identity_repo import UserPrincipal
 from ..deps import get_agents_repo, get_events_repo
 from ..limits import read_limited
@@ -53,8 +54,13 @@ async def upload_recording(
     if record.event.kind is EventKind.BATHROOM_DURATION:
         raise HTTPException(403, "recording_not_allowed")
     repo = request.app.state.recordings_repo
-    await repo.save(household_id=agent.household_id, event_id=event_id,
-                    camera_id=record.event.camera_id, body=body, content_type=content_type)
+    try:
+        await repo.save(household_id=agent.household_id, event_id=event_id,
+                        camera_id=record.event.camera_id, body=body, content_type=content_type)
+    except RecordingsCapacityExceeded as exc:
+        raise HTTPException(507, 'recording_capacity') from exc
+    except (ValueError, OSError) as exc:
+        raise HTTPException(503, 'recording_storage_unavailable') from exc
     await repo.prune(settings.recording_retention_days)
     return Response(status_code=204)
 

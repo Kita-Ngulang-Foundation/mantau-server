@@ -49,15 +49,18 @@ async def ingest(
     if camera_id is not None and await cameras.get_for_agent(envelope.agent_id, camera_id) is None:
         raise HTTPException(404, "resource_not_found")
 
-    result = await record_envelope(envelope, db)
-    await agents.touch(envelope.agent_id)
+    async with db.transaction():
+        # Validation and mutation share the same lock; a revoked device cannot
+        # complete a request validated before camera/account removal.
+        current_agent = await agents.get(envelope.agent_id)
+        if current_agent is None or current_agent.revoked_at is not None or current_agent.household_id != agent.household_id:
+            raise HTTPException(401, 'unauthorized')
+        if camera_id is not None and await cameras.get_for_agent(envelope.agent_id, camera_id) is None:
+            raise HTTPException(404, 'resource_not_found')
+        result = await record_envelope(envelope, db)
+        await agents.touch(envelope.agent_id)
+        if not result.duplicate and envelope.kind is PayloadKind.FALL_EVENT:
+            await dispatcher.dispatch(event, household_id=agent.household_id, agent_id=agent.agent_id, deliver=False)
+    await dispatcher.outbox.deliver_pending()
 
-    if result.duplicate:
-        # Already processed -- do NOT dispatch again. Still 200: the agent's
-        # retry succeeded from its point of view, nothing was lost.
-        return IngestResponse(status="accepted", duplicate=True, out_of_order=result.out_of_order)
-
-    if envelope.kind is PayloadKind.FALL_EVENT:
-        await dispatcher.dispatch(event, household_id=agent.household_id, agent_id=agent.agent_id)
-
-    return IngestResponse(status="accepted", duplicate=False, out_of_order=result.out_of_order)
+    return IngestResponse(status="accepted", duplicate=result.duplicate, out_of_order=result.out_of_order)

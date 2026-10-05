@@ -1,9 +1,8 @@
 """Persistence for fall/anomaly events.
 
 `status` mirrors the app's own `FallStatus` enum exactly (needs_review /
-dismissed / confirmed). Clip attachment is out of scope this pass -- no clip
-extraction runs on the agent's live path yet, so `FallEvent.clip` always
-round-trips as None.
+dismissed / confirmed). Recording availability is indexed separately from
+the event payload; history retention removes both delivery work and clips.
 """
 
 from __future__ import annotations
@@ -11,11 +10,13 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import aiosqlite
 from mantau_core.contracts import EventKind, FallEvent, Severity
 
 from .db import Database
+from .transactions import serialized_repository
 
 VALID_STATUSES = {"needs_review", "dismissed", "confirmed"}
 
@@ -71,6 +72,7 @@ def _row_to_record(row: aiosqlite.Row) -> EventRecord:
     )
 
 
+@serialized_repository
 class EventsRepo:
     def __init__(self, db: Database) -> None:
         self._db = db
@@ -175,3 +177,63 @@ class EventsRepo:
         )
         await self._db.conn.commit()
         return cursor.rowcount > 0
+
+    async def prune(self, retention_days: int, *, recordings_root: str | Path | None = None,
+                    household_id: str | None = None, batch_size: int = 200) -> int:
+        """Remove one bounded batch of expired history and its delivery records.
+
+        Retention uses server storage time, so newly received older detections
+        remain reviewable. A configured recording root permits clip cleanup;
+        without it, events with indexed clips are retained. Files are removed
+        before database changes; a storage error preserves the rows for retry,
+        and retries tolerate files already removed by a partial cleanup.
+        """
+        if retention_days < 1 or not 1 <= batch_size <= 500:
+            raise ValueError("Positive retention and batch_size between 1 and 500 required")
+        if self._db.in_atomic:
+            raise RuntimeError("Event retention requires its own transaction")
+        root = Path(recordings_root).resolve() if recordings_root is not None else None
+        async with self._db.transaction():
+            sql = "SELECT e.event_id,e.household_id FROM events e WHERE e.created_at<?"
+            params: list = [time.time() - retention_days * 86400]
+            if household_id is not None:
+                sql += " AND e.household_id=?"
+                params.append(household_id)
+            if root is None:
+                sql += " AND NOT EXISTS(SELECT 1 FROM recordings r WHERE r.event_id=e.event_id)"
+            sql += " ORDER BY e.created_at,e.event_id LIMIT ?"
+            params.append(batch_size)
+            expired = await (await self._db.conn.execute(sql, params)).fetchall()
+            if not expired:
+                return 0
+            ids = [row["event_id"] for row in expired]
+            placeholders = ",".join("?" for _ in ids)
+            clips = await (await self._db.conn.execute(
+                "SELECT r.storage_key,r.household_id,e.household_id AS event_household_id "
+                "FROM recordings r JOIN events e ON e.event_id=r.event_id "
+                f"WHERE e.event_id IN ({placeholders})",
+                ids)).fetchall()
+            paths = []
+            for clip in clips:
+                if clip["household_id"] != clip["event_household_id"]:
+                    raise ValueError("Recording household does not match event")
+                path = (root / clip["storage_key"]).resolve()
+                # A corrupted index or symlink must never target another
+                # household or a location outside the configured volume.
+                household_root = (root / clip["household_id"]).resolve()
+                household_root.relative_to(root)
+                path.relative_to(household_root)
+                paths.append(path)
+            for path in paths:
+                path.unlink(missing_ok=True)
+            await self._db.conn.execute(
+                f"DELETE FROM push_outbox WHERE event_id IN ({placeholders})", ids)
+            await self._db.conn.execute(
+                f"DELETE FROM inference_confirmations WHERE event_id IN ({placeholders})", ids)
+            # Explicit removal also works for upgraded databases whose legacy
+            # recording foreign key did not specify ON DELETE CASCADE.
+            await self._db.conn.execute(
+                f"DELETE FROM recordings WHERE event_id IN ({placeholders})", ids)
+            deleted = await self._db.conn.execute(
+                f"DELETE FROM events WHERE event_id IN ({placeholders})", ids)
+        return deleted.rowcount

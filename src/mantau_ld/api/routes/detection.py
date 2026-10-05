@@ -16,6 +16,7 @@ from pydantic import BaseModel
 
 from ...control_auth import authenticated_user
 from ...store.identity_repo import UserPrincipal
+from ...store.detection_settings_repo import SettingsConflict
 from ..deps import get_cameras_repo, get_control_repo
 from ...store.cameras_repo import CamerasRepo
 from ...store.control_repo import ControlRepo
@@ -53,18 +54,22 @@ async def put_settings(camera_id: str, body: DetectionSettings, request: Request
     if principal.role not in ("owner", "admin"):
         raise HTTPException(403, "forbidden")
     repo = request.app.state.detection_settings_repo
-    stored = await repo.save(principal.household_id, camera_id, body, principal.user_id)
-    command_id = None
-    if camera.agent_id:
-        command = await control.queue(
-            agent_id=camera.agent_id, household_id=principal.household_id,
-            requested_by_user_id=principal.user_id,
-            command_type=CommandType.APPLY_DETECTION_SETTINGS,
-            payload={"camera_id": camera_id, "settings": stored.model_dump(mode="json")},
-            idempotency_key=f"detection-settings-{camera_id}-{stored.version}-{uuid.uuid4().hex}",
-            ttl_s=request.app.state.settings.command_ttl_s,
-        )
-        command_id = command.command_id
+    try:
+        async with request.app.state.db.transaction():
+            stored = await repo.save(principal.household_id, camera_id, body, principal.user_id)
+            command_id = None
+            if camera.agent_id:
+                command = await control.queue(
+                    agent_id=camera.agent_id, household_id=principal.household_id,
+                    requested_by_user_id=principal.user_id,
+                    command_type=CommandType.APPLY_DETECTION_SETTINGS,
+                    payload={"camera_id": camera_id, "settings": stored.model_dump(mode="json")},
+                    idempotency_key=f"detection-settings-{camera_id}-{stored.version}-{uuid.uuid4().hex}",
+                    ttl_s=request.app.state.settings.command_ttl_s,
+                )
+                command_id = command.command_id
+    except SettingsConflict as exc:
+        raise HTTPException(409, "settings_version_conflict") from exc
     current = await repo.get(principal.household_id, camera_id)
     return DetectionSettingsOut(camera_id=camera_id, settings=stored,
                                 applied_version=current.applied_version, customized=True,

@@ -8,6 +8,7 @@ event's household -- there is no other channel.
 from __future__ import annotations
 
 import logging
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -28,7 +29,7 @@ from ..store.agents_repo import AgentsRepo
 from ..store.cameras_repo import CamerasRepo
 from ..store.control_repo import ControlRepo
 from ..store.db import Database
-from ..store.detection_settings_repo import DetectionSettingsRepo, migrate_floor_default
+from ..store.detection_settings_repo import DetectionSettingsRepo
 from ..store.recordings_repo import RecordingsRepo
 from ..store.events_repo import EventsRepo
 from ..store.identity_repo import IdentityRepo
@@ -116,17 +117,9 @@ def create_app(
         app.state.ack_service = AckService()
         app.state.frames = FrameStore()
         app.state.detection_settings_repo = DetectionSettingsRepo(db)
-        try:
-            floor_migration = await migrate_floor_default(
-                db, control_repo, ttl_s=settings.command_ttl_s)
-        except Exception:
-            # Rolled back as a whole; the next startup tries again.
-            log.exception("floor-default detection-settings migration failed; nothing changed")
-        else:
-            if floor_migration is not None:
-                log.info("floor-default migration: %d camera(s) moved floor_minutes 2.0 -> 0.5, "
-                         "%d apply_detection_settings command(s) queued", *floor_migration)
-        app.state.recordings_repo = RecordingsRepo(db, settings.recordings_dir)
+        app.state.recordings_repo = RecordingsRepo(db, settings.recordings_dir,
+            household_max_bytes=settings.recording_household_max_bytes,
+            global_max_bytes=settings.recording_global_max_bytes)
         await app.state.recordings_repo.prune(settings.recording_retention_days)
         app.state.inference_repo = InferenceRepo(db)
         await app.state.inference_repo.prune(settings.inference_result_retention_days)
@@ -134,9 +127,24 @@ def create_app(
             settings, factory=inference_factory, decoder=inference_decoder)
         await app.state.inference.start()
 
+        await dispatcher.outbox.start()
+        async def maintain():
+            while True:
+                try:
+                    await app.state.recordings_repo.prune(settings.recording_retention_days)
+                    await app.state.inference_repo.prune(settings.inference_result_retention_days)
+                    await events_repo.prune(settings.event_retention_days,
+                                            recordings_root=settings.recordings_dir)
+                except Exception:
+                    log.exception("Retention maintenance failed")
+                await asyncio.sleep(max(60.0, settings.maintenance_interval_s))
+        maintenance = asyncio.create_task(maintain(), name="retention-maintenance")
         try:
             yield
         finally:
+            maintenance.cancel()
+            await asyncio.gather(maintenance, return_exceptions=True)
+            await dispatcher.outbox.close()
             await app.state.inference.close()
             await db.close()
             sync_db.close()

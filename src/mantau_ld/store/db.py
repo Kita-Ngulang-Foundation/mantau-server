@@ -11,12 +11,43 @@ guaranteed no-op. See `ingest/dedupe.py`.
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import asynccontextmanager
+
+from .transactions import TransactionConnection
+
 import hashlib
 from pathlib import Path
 
 import aiosqlite
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS inference_answers (
+    agent_id TEXT NOT NULL REFERENCES agents(agent_id) ON DELETE CASCADE,
+    frame_id TEXT NOT NULL, camera_id TEXT NOT NULL, household_id TEXT NOT NULL,
+    request_hash TEXT NOT NULL, result_json TEXT NOT NULL, created_at REAL NOT NULL,
+    PRIMARY KEY(agent_id,frame_id)
+);
+CREATE TABLE IF NOT EXISTS account_deletions (
+    identity_hash TEXT PRIMARY KEY,
+    deleted_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS push_outbox (
+    id INTEGER PRIMARY KEY,
+    event_id TEXT NOT NULL REFERENCES events(event_id),
+    household_id TEXT NOT NULL,
+    channel INTEGER NOT NULL,
+    target TEXT NOT NULL,
+    alert_json TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    device_id TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at REAL NOT NULL DEFAULT 0,
+    last_error TEXT,
+    UNIQUE(event_id,channel,device_id)
+);
+CREATE INDEX IF NOT EXISTS idx_push_outbox_due ON push_outbox(state,next_attempt_at);
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version     INTEGER PRIMARY KEY,
     applied_at  REAL NOT NULL
@@ -278,6 +309,9 @@ async def _migrate_existing(conn: aiosqlite.Connection) -> None:
     await _add_column(conn, "agents", "enrollment_id TEXT")
     await _add_column(conn, "agents", "credential_version INTEGER NOT NULL DEFAULT 1")
     await _add_column(conn, "agents", "name TEXT")
+    await _add_column(conn, "agents", "last_frame_at REAL")
+    await _add_column(conn, "agents", "last_inference_at REAL")
+    await _add_column(conn, "cameras", "revoked_at REAL")
     # v3: display-only profile claims for member lists.
     await _add_column(conn, "events", "zone_id TEXT")
     await _add_column(conn, "users", "email TEXT")
@@ -396,6 +430,11 @@ class Database:
     def __init__(self, path: str) -> None:
         self.path = path
         self._conn: aiosqlite.Connection | None = None
+        self._lock = asyncio.Lock()
+        self._owner = None
+        self._atomic_owner = None
+        self._atomic_failed = False
+        self._proxy = TransactionConnection(self)
 
     async def connect(self) -> None:
         uri, is_uri = _connect_target(self.path)
@@ -416,7 +455,48 @@ class Database:
     def conn(self) -> aiosqlite.Connection:
         if self._conn is None:
             raise RuntimeError("Database.connect() was never called")
-        return self._conn
+        return self._proxy
+
+    @property
+    def in_atomic(self):
+        return self._atomic_owner is asyncio.current_task()
+
+    @asynccontextmanager
+    async def serialized(self):
+        task = asyncio.current_task()
+        if self._owner is task:
+            yield
+            return
+        async with self._lock:
+            self._owner = task
+            try:
+                yield
+            except BaseException:
+                if self._conn.in_transaction:
+                    await self._conn.rollback()
+                raise
+            finally:
+                self._owner = None
+
+    @asynccontextmanager
+    async def transaction(self):
+        async with self.serialized():
+            if self.in_atomic:
+                yield
+                return
+            self._atomic_owner = asyncio.current_task()
+            self._atomic_failed = False
+            try:
+                await self._conn.execute('BEGIN IMMEDIATE')
+                yield
+                if self._atomic_failed:
+                    raise RuntimeError('transaction rolled back')
+                await self._conn.commit()
+            except BaseException:
+                await self._conn.rollback()
+                raise
+            finally:
+                self._atomic_owner = None
 
     async def __aenter__(self) -> "Database":
         await self.connect()
