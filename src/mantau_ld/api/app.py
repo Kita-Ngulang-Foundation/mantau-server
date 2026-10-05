@@ -28,7 +28,7 @@ from ..store.agents_repo import AgentsRepo
 from ..store.cameras_repo import CamerasRepo
 from ..store.control_repo import ControlRepo
 from ..store.db import Database
-from ..store.detection_settings_repo import DetectionSettingsRepo
+from ..store.detection_settings_repo import DetectionSettingsRepo, migrate_floor_default
 from ..store.recordings_repo import RecordingsRepo
 from ..store.events_repo import EventsRepo
 from ..store.identity_repo import IdentityRepo
@@ -116,6 +116,16 @@ def create_app(
         app.state.ack_service = AckService()
         app.state.frames = FrameStore()
         app.state.detection_settings_repo = DetectionSettingsRepo(db)
+        try:
+            floor_migration = await migrate_floor_default(
+                db, control_repo, ttl_s=settings.command_ttl_s)
+        except Exception:
+            # Rolled back as a whole; the next startup tries again.
+            log.exception("floor-default detection-settings migration failed; nothing changed")
+        else:
+            if floor_migration is not None:
+                log.info("floor-default migration: %d camera(s) moved floor_minutes 2.0 -> 0.5, "
+                         "%d apply_detection_settings command(s) queued", *floor_migration)
         app.state.recordings_repo = RecordingsRepo(db, settings.recordings_dir)
         await app.state.recordings_repo.prune(settings.recording_retention_days)
         app.state.inference_repo = InferenceRepo(db)
