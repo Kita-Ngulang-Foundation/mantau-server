@@ -25,6 +25,13 @@ RUN set -eu; \
     fi; \
     pip install --no-cache-dir -e .
 
+# THIRD_PARTY_NOTICES.md for everything installed above (plan Phase 6 step 5).
+# pip-licenses goes to a throwaway directory, so it does not ship in the image.
+RUN set -eu; \
+    pip install --no-cache-dir --target /tmp/pip-licenses pip-licenses; \
+    PYTHONPATH=/tmp/pip-licenses python scripts/third_party_notices.py; \
+    rm -rf /tmp/pip-licenses
+
 ENV MANTAU_DB_PATH=/data/mantau_ld.db
 ENV MANTAU_RECORDINGS_DIR=/data/recordings
 
