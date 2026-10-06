@@ -372,7 +372,8 @@ def test_cross_household_camera_and_events_are_isolated():
 def test_real_detector_finds_a_fall_in_uploaded_frames():
     pytest.importorskip("mantau.api.streaming")
     cv2 = pytest.importorskip("cv2")
-    clip = Path(__file__).resolve().parents[2] / "mantau-AI" / "data" / "falls" / "video_1.mp4"
+    clip = (Path(__file__).resolve().parents[2] / "mantau-AI" / "datasets" / "gmdcsa24"
+            / "Subject 1" / "Fall" / "01.mp4")
     if not clip.exists():
         pytest.skip(f"{clip} not present")
     app = create_app(Settings(db_path=":memory:", control_plane_mode="local_dev",
