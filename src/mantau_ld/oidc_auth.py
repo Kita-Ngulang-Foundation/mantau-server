@@ -1,8 +1,11 @@
-"""OIDC JWT bearer validation without coupling app users to agent identity."""
+"""Firebase ID token (an OIDC JWT) validation, without coupling app users to
+agent identity."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
+import time
 from typing import Protocol
 
 import jwt
@@ -29,6 +32,7 @@ class OidcIdentity:
     # Display only (member lists). Never used for identity or authorization.
     email: str | None = None
     name: str | None = None
+    authenticated_at: float | None = None
 
 
 class OidcAuthenticator:
@@ -79,8 +83,17 @@ class OidcAuthenticator:
             raise OidcTokenError("invalid bearer token")
         email = claims.get("email")
         name = claims.get("name")
+        # A refresh advances iat without a new interactive login. Only auth_time
+        # may authorize recreating a profile after explicit deletion.
+        authenticated_at = claims.get('auth_time')
+        if authenticated_at is not None and (isinstance(authenticated_at, bool) or
+                not isinstance(authenticated_at, (int, float)) or
+                not math.isfinite(authenticated_at) or authenticated_at < 0 or
+                authenticated_at > time.time() + self.leeway_s):
+            raise OidcTokenError('invalid authentication time')
         return OidcIdentity(
             issuer=self.issuer, subject=subject.strip(),
             email=email[:254] if isinstance(email, str) and email else None,
             name=name[:120] if isinstance(name, str) and name else None,
+            authenticated_at=authenticated_at,
         )

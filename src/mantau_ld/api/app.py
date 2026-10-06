@@ -1,36 +1,35 @@
 """The FastAPI app factory: wire mantau_core + this repo's own store/ingest
 into `app.state`, once, in `lifespan`.
 
-Production uses owned push recipients only. Explicit local-development mode
-may additionally use the legacy Telegram or console demonstration channels.
+Alerts go out as FCM push to every device registered by a member of the
+event's household -- there is no other channel.
 """
 
 from __future__ import annotations
 
 import logging
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from mantau_core.notify import ChannelBinding, Fanout, FixedBinding, PushBinding, TelegramBinding
-from mantau_core.notify.channels.console import ConsoleChannel
+from mantau_core.notify import ChannelBinding, Fanout, PushBinding
+from mantau_core.notify.protocol import Notifier
 from mantau_core.notify.channels.push import FCMPushChannel, ServiceAccountCredentials
-from mantau_core.notify.channels.telegram import TelegramChannel
 from mantau_core.notify.delivery import AckService, DeliveryTracker
 
 from ..alerts.dispatcher import AlertDispatcher
-from ..config import Settings
+from ..config import FIREBASE_JWKS_URL, Settings
 from ..frames import FrameStore
-from ..heartbeats import HeartbeatTracker
 from ..inference.service import DetectorFactory, FrameDecoder, InferenceService
 from ..oidc_auth import OidcAuthenticator
 from ..store.agents_repo import AgentsRepo
 from ..store.cameras_repo import CamerasRepo
 from ..store.control_repo import ControlRepo
 from ..store.db import Database
-from ..store.detection_settings_repo import DetectionSettingsRepo, migrate_floor_default
+from ..store.detection_settings_repo import DetectionSettingsRepo
 from ..store.recordings_repo import RecordingsRepo
 from ..store.events_repo import EventsRepo
 from ..store.identity_repo import IdentityRepo
@@ -40,7 +39,7 @@ from ..store.sync_db import SyncDatabase
 from ..store.token_store import SqliteTokenStore
 log = logging.getLogger("mantau_ld")
 # aiosqlite logs every statement with its parameters at DEBUG, which would put
-# agent secrets, claim-code hashes, and FCM tokens into logs.
+# agent secrets, enrollment-key hashes, and FCM tokens into logs.
 logging.getLogger("aiosqlite").setLevel(logging.INFO)
 
 from .routes import (  # noqa: E402
@@ -50,25 +49,15 @@ from .routes import (  # noqa: E402
 
 
 def _build_channels(
-    settings: Settings, resolver: SqliteRecipientResolver, token_store: SqliteTokenStore
+    settings: Settings, resolver: SqliteRecipientResolver, token_store: SqliteTokenStore,
+    push_notifier: Notifier | None,
 ) -> list[ChannelBinding]:
-    channels: list[ChannelBinding] = []
-    if settings.push_configured:
+    if push_notifier is None:
+        if not settings.push_configured:
+            return []
         credentials = ServiceAccountCredentials(settings.fcm_service_account_path)
-        fcm = FCMPushChannel(settings.fcm_project_id, credentials, token_store)
-        channels.append(PushBinding(notifier=fcm, resolver=resolver))
-    if (settings.control_plane_mode == "local_dev" and settings.telegram_configured
-            and settings.telegram_chat_id_list()):
-        telegram = TelegramChannel(settings.telegram_bot_token)
-        channels.append(TelegramBinding(notifier=telegram, chat_ids=settings.telegram_chat_id_list()))
-    if not channels and settings.control_plane_mode == "local_dev":
-        print("[mantau-ld] no push/Telegram configured -- alerts go to the console only")
-        # FixedBinding, not PushBinding: a console fallback must fire
-        # regardless of whether any device is registered yet -- PushBinding
-        # resolves targets from the (empty, on a fresh checkout) device
-        # resolver, which silently never fires. See FixedBinding's docstring.
-        channels.append(FixedBinding(notifier=ConsoleChannel(), targets=["console"]))
-    return channels
+        push_notifier = FCMPushChannel(settings.fcm_project_id, credentials, token_store)
+    return [PushBinding(notifier=push_notifier, resolver=resolver)]
 
 
 def create_app(
@@ -77,17 +66,19 @@ def create_app(
     oidc_authenticator: OidcAuthenticator | None = None,
     inference_factory: DetectorFactory | None = None,
     inference_decoder: FrameDecoder | None = None,
+    push_notifier: Notifier | None = None,
 ) -> FastAPI:
     """`inference_factory`/`inference_decoder` replace the MediaPipe detector
     and JPEG decoder (tests); by default the real ones are used when the
-    `detection` extra is installed, and inference reports unavailable if not."""
+    `detection` extra is installed, and inference reports unavailable if not.
+    `push_notifier` replaces FCM delivery to registered devices (tests)."""
     settings = settings or Settings()
     oidc_authenticator = oidc_authenticator or OidcAuthenticator(
-        issuer=settings.oidc_issuer,
-        audience=settings.oidc_audience,
-        jwks_url=settings.oidc_jwks_url,
-        algorithms=settings.oidc_algorithm_list(),
-        leeway_s=settings.oidc_leeway_s,
+        issuer=settings.auth_issuer,
+        audience=settings.auth_project_id,
+        jwks_url=FIREBASE_JWKS_URL,
+        algorithms=["RS256"],
+        leeway_s=settings.auth_leeway_s,
     )
 
     @asynccontextmanager
@@ -95,7 +86,7 @@ def create_app(
         problems = settings.configuration_problems()
         if problems:
             # Serving continues so /ready can report it; user routes already
-            # fail closed (503) without OIDC.
+            # fail closed (503) without a Firebase project.
             log.error("mantau-server misconfigured; missing: %s", ", ".join(problems))
         db = Database(settings.db_path)
         await db.connect()
@@ -109,7 +100,7 @@ def create_app(
         token_store = SqliteTokenStore(sync_db)
         resolver = SqliteRecipientResolver(sync_db, token_store)
 
-        fanout = Fanout(channels=_build_channels(settings, resolver, token_store), tracker=DeliveryTracker())
+        fanout = Fanout(channels=_build_channels(settings, resolver, token_store, push_notifier), tracker=DeliveryTracker())
         dispatcher = AlertDispatcher(events_repo, cameras_repo, fanout)
 
         app.state.settings = settings
@@ -124,20 +115,11 @@ def create_app(
         app.state.resolver = resolver
         app.state.dispatcher = dispatcher
         app.state.ack_service = AckService()
-        app.state.heartbeats = HeartbeatTracker()
         app.state.frames = FrameStore()
         app.state.detection_settings_repo = DetectionSettingsRepo(db)
-        try:
-            floor_migration = await migrate_floor_default(
-                db, control_repo, ttl_s=settings.command_ttl_s)
-        except Exception:
-            # Rolled back as a whole; the next startup tries again.
-            log.exception("floor-default detection-settings migration failed; nothing changed")
-        else:
-            if floor_migration is not None:
-                log.info("floor-default migration: %d camera(s) moved floor_minutes 2.0 -> 0.5, "
-                         "%d apply_detection_settings command(s) queued", *floor_migration)
-        app.state.recordings_repo = RecordingsRepo(db, settings.recordings_dir)
+        app.state.recordings_repo = RecordingsRepo(db, settings.recordings_dir,
+            household_max_bytes=settings.recording_household_max_bytes,
+            global_max_bytes=settings.recording_global_max_bytes)
         await app.state.recordings_repo.prune(settings.recording_retention_days)
         app.state.inference_repo = InferenceRepo(db)
         await app.state.inference_repo.prune(settings.inference_result_retention_days)
@@ -145,9 +127,24 @@ def create_app(
             settings, factory=inference_factory, decoder=inference_decoder)
         await app.state.inference.start()
 
+        await dispatcher.outbox.start()
+        async def maintain():
+            while True:
+                try:
+                    await app.state.recordings_repo.prune(settings.recording_retention_days)
+                    await app.state.inference_repo.prune(settings.inference_result_retention_days)
+                    await events_repo.prune(settings.event_retention_days,
+                                            recordings_root=settings.recordings_dir)
+                except Exception:
+                    log.exception("Retention maintenance failed")
+                await asyncio.sleep(max(60.0, settings.maintenance_interval_s))
+        maintenance = asyncio.create_task(maintain(), name="retention-maintenance")
         try:
             yield
         finally:
+            maintenance.cancel()
+            await asyncio.gather(maintenance, return_exceptions=True)
+            await dispatcher.outbox.close()
             await app.state.inference.close()
             await db.close()
             sync_db.close()
@@ -171,7 +168,7 @@ def create_app(
         app.add_middleware(
             CORSMiddleware,
             allow_origins=settings.cors_origin_list(),
-            allow_methods=["GET", "POST", "PUT", "DELETE"],
+            allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
             allow_headers=["Authorization", "Content-Type", "Idempotency-Key",
                            "X-Mantau-Household-ID"],
         )

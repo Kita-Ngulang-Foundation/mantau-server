@@ -12,11 +12,12 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from ...control_auth import authenticated_identity, authenticated_user
+from ...control_auth import authenticated_identity, authenticated_user, verified_identity, assert_identity_active
 from ...oidc_auth import OidcIdentity
 from ...store.identity_repo import (
     AlreadyMember, InviteInvalid, LastOwner, RateLimited, UserPrincipal,
 )
+from ...store.lifecycle_repo import LifecycleRepo, OwnershipRequired
 
 router = APIRouter(prefix="/households", tags=["households"])
 
@@ -70,7 +71,9 @@ def _manager(principal: UserPrincipal) -> None:
 async def list_households(
     request: Request, identity: OidcIdentity = Depends(authenticated_identity)
 ) -> list[dict]:
-    return await request.app.state.identity_repo.households(identity.issuer, identity.subject)
+    async with request.app.state.db.transaction():
+        await assert_identity_active(request, identity)
+        return await request.app.state.identity_repo.households(identity.issuer, identity.subject)
 
 
 @router.post("/join", response_model=HouseholdOut)
@@ -78,20 +81,24 @@ async def join_household(body: InviteAccept, request: Request,
                          identity: OidcIdentity = Depends(authenticated_identity)) -> dict:
     repo = request.app.state.identity_repo
     settings = request.app.state.settings
-    user_id = await repo.ensure_user(identity)
     try:
-        household_id = await repo.accept_invite(
-            body.invite_code, user_id,
-            attempt_limit=settings.invite_attempt_limit,
-            attempt_window_s=settings.invite_attempt_window_s,
-        )
+        # The invite repository persists failed-attempt rate limits itself.
+        # Hold serialization through the guard without rolling those attempts back.
+        async with request.app.state.db.serialized():
+            await assert_identity_active(request, identity)
+            user_id = await repo.ensure_user(identity)
+            household_id = await repo.accept_invite(
+                body.invite_code, user_id,
+                attempt_limit=settings.invite_attempt_limit,
+                attempt_window_s=settings.invite_attempt_window_s,
+            )
+            households = await repo.households(identity.issuer, identity.subject)
     except RateLimited as exc:
         raise HTTPException(429, "rate_limited") from exc
     except InviteInvalid as exc:
         raise HTTPException(404, "invite_not_found") from exc
     except AlreadyMember as exc:
         raise HTTPException(409, "already_member") from exc
-    households = await repo.households(identity.issuer, identity.subject)
     return next(h for h in households if h["household_id"] == household_id)
 
 
@@ -151,3 +158,85 @@ async def remove_member(household_id: str, user_id: str, request: Request,
         raise HTTPException(409, "last_owner") from exc
     if not removed:
         raise HTTPException(404, "resource_not_found")
+
+
+def _lifecycle(request):
+    return LifecycleRepo(request.app.state.db, request.app.state.settings.recordings_dir)
+
+
+@router.put('/{household_id}/owners/{user_id}', status_code=204)
+async def promote_owner(household_id: str, user_id: str, request: Request,
+                        principal: UserPrincipal = Depends(authenticated_user)):
+    _same_household(principal, household_id)
+    try:
+        await _lifecycle(request).promote_owner(household_id, principal.user_id, user_id)
+    except OwnershipRequired as exc:
+        raise HTTPException(403, 'owner_required') from exc
+    except LookupError as exc:
+        raise HTTPException(404, 'resource_not_found') from exc
+
+
+@router.get('/{household_id}/export')
+async def export_household(household_id: str, request: Request,
+                           principal: UserPrincipal = Depends(authenticated_user)):
+    _same_household(principal, household_id)
+    try:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(await _lifecycle(request).export(household_id, principal.user_id),
+                            headers={'Cache-Control': 'private, no-store'})
+    except OwnershipRequired as exc:
+        raise HTTPException(403, 'owner_required') from exc
+
+
+class DeletionConfirmation(BaseModel):
+    confirm_household_id: str
+
+
+@router.delete('/{household_id}', status_code=204)
+async def delete_household(household_id: str, body: DeletionConfirmation, request: Request,
+                           principal: UserPrincipal = Depends(authenticated_user)):
+    _same_household(principal, household_id)
+    if body.confirm_household_id != household_id:
+        raise HTTPException(400, 'confirmation_required')
+    cameras = await request.app.state.cameras_repo.list_for_household(household_id)
+    try:
+        await _lifecycle(request).delete_household(household_id, principal.user_id)
+    except OwnershipRequired as exc:
+        raise HTTPException(403, 'owner_required') from exc
+    except OSError as exc:
+        raise HTTPException(503, 'data_deletion_unavailable') from exc
+    for camera in cameras:
+        request.app.state.frames.forget(camera.camera_id)
+
+
+@router.delete('/account/me', status_code=204)
+async def delete_account(request: Request, identity: OidcIdentity = Depends(verified_identity)):
+    try:
+        async with request.app.state.db.transaction():
+            await assert_identity_active(request, identity)
+            row = await (await request.app.state.db.conn.execute(
+                'SELECT user_id FROM user_identities WHERE oidc_issuer=? AND oidc_subject=?',
+                (identity.issuer, identity.subject))).fetchone()
+            if row is not None:
+                await _lifecycle(request).delete_user(row[0])
+    except ValueError as exc:
+        raise HTTPException(409, 'last_owner') from exc
+
+
+@router.get('/{household_id}/diagnostics')
+async def diagnostics(household_id: str, request: Request,
+                      principal: UserPrincipal = Depends(authenticated_user)):
+    _same_household(principal, household_id)
+    async with request.app.state.db.serialized():
+        deliveries = await (await request.app.state.db.conn.execute(
+            'SELECT state,COUNT(*) AS count FROM push_outbox WHERE household_id=? GROUP BY state',
+            (household_id,))).fetchall()
+        storage = await (await request.app.state.db.conn.execute(
+            'SELECT COALESCE(SUM(size_bytes),0) FROM recordings WHERE household_id=?',
+            (household_id,))).fetchone()
+    settings = request.app.state.settings
+    return {'event_retention_days': settings.event_retention_days,
+            'recording_retention_days': settings.recording_retention_days,
+            'recording_bytes': storage[0], 'delivery_states': {row['state']:row['count'] for row in deliveries},
+            'household_storage_limit_bytes': settings.recording_household_max_bytes,
+            'inference_available': request.app.state.inference.available}

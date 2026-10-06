@@ -9,13 +9,12 @@ from mantau_core.contracts import Envelope, PayloadKind
 from pydantic import BaseModel
 
 from ...alerts.dispatcher import AlertDispatcher
-from ...heartbeats import HeartbeatTracker
 from ...ingest.dedupe import record_envelope
 from ...ingest.verify import VerificationError, verify_envelope
 from ...store.agents_repo import AgentsRepo
 from ...store.cameras_repo import CamerasRepo
 from ...store.db import Database
-from ..deps import get_agents_repo, get_cameras_repo, get_db, get_dispatcher, get_heartbeats
+from ..deps import get_agents_repo, get_cameras_repo, get_db, get_dispatcher
 
 router = APIRouter(tags=["ingest"])
 
@@ -33,7 +32,6 @@ async def ingest(
     cameras: CamerasRepo = Depends(get_cameras_repo),
     db: Database = Depends(get_db),
     dispatcher: AlertDispatcher = Depends(get_dispatcher),
-    heartbeats: HeartbeatTracker = Depends(get_heartbeats),
 ) -> IngestResponse:
     try:
         await verify_envelope(envelope, agents)
@@ -51,17 +49,18 @@ async def ingest(
     if camera_id is not None and await cameras.get_for_agent(envelope.agent_id, camera_id) is None:
         raise HTTPException(404, "resource_not_found")
 
-    result = await record_envelope(envelope, db)
-    await agents.touch(envelope.agent_id)
+    async with db.transaction():
+        # Validation and mutation share the same lock; a revoked device cannot
+        # complete a request validated before camera/account removal.
+        current_agent = await agents.get(envelope.agent_id)
+        if current_agent is None or current_agent.revoked_at is not None or current_agent.household_id != agent.household_id:
+            raise HTTPException(401, 'unauthorized')
+        if camera_id is not None and await cameras.get_for_agent(envelope.agent_id, camera_id) is None:
+            raise HTTPException(404, 'resource_not_found')
+        result = await record_envelope(envelope, db)
+        await agents.touch(envelope.agent_id)
+        if not result.duplicate and envelope.kind is PayloadKind.FALL_EVENT:
+            await dispatcher.dispatch(event, household_id=agent.household_id, agent_id=agent.agent_id, deliver=False)
+    await dispatcher.outbox.deliver_pending()
 
-    if result.duplicate:
-        # Already processed -- do NOT dispatch again. Still 200: the agent's
-        # retry succeeded from its point of view, nothing was lost.
-        return IngestResponse(status="accepted", duplicate=True, out_of_order=result.out_of_order)
-
-    if envelope.kind is PayloadKind.FALL_EVENT:
-        await dispatcher.dispatch(event, household_id=agent.household_id, agent_id=agent.agent_id)
-    elif envelope.kind is PayloadKind.HEARTBEAT:
-        heartbeats.record(heartbeat)
-
-    return IngestResponse(status="accepted", duplicate=False, out_of_order=result.out_of_order)
+    return IngestResponse(status="accepted", duplicate=result.duplicate, out_of_order=result.out_of_order)

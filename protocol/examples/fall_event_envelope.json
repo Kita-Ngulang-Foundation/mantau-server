@@ -1,0 +1,21 @@
+{
+  "agent_id": "agent-3f9a1c2b",
+  "seq": 42,
+  "sent_at": "2026-09-13T04:12:03.114000Z",
+  "kind": "fall_event",
+  "payload": {
+    "event_id": "ev-a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
+    "camera_id": "cam-kamar-ibu",
+    "kind": "fall",
+    "severity": "critical",
+    "occurred_at": "2026-09-13T04:12:03.114000Z",
+    "confidence": 0.91,
+    "track_id": 3,
+    "signals": {
+      "velocity": 0.52,
+      "torso_angle_deg": 84.0
+    },
+    "clip": null
+  },
+  "sig": "519819de4ab4a40640786d32f18a7aa3ddc19e7d98b548dbc606ef2d3a15c5c0"
+}

@@ -3,6 +3,7 @@ from mantau_core.contracts import Envelope, FallEvent
 
 from mantau_ld.ingest.dedupe import record_envelope
 from mantau_ld.ingest.verify import VerificationError, verify_envelope
+import support
 from mantau_ld.store.agents_repo import AgentsRepo
 from mantau_ld.store.db import Database
 
@@ -12,7 +13,7 @@ async def test_verify_accepts_a_correctly_signed_envelope():
     await db.connect()
     try:
         agents = AgentsRepo(db)
-        agent = await agents.enroll("agent-1")
+        agent = await support.enroll_in_db(db, "agent-1")
         event = FallEvent(camera_id="cam-1", confidence=0.9)
         envelope = Envelope.for_event("agent-1", seq=0, event=event).sign(agent.secret)
 
@@ -41,7 +42,7 @@ async def test_verify_rejects_a_bad_signature():
     await db.connect()
     try:
         agents = AgentsRepo(db)
-        await agents.enroll("agent-1")
+        await support.enroll_in_db(db, "agent-1")
         event = FallEvent(camera_id="cam-1")
         envelope = Envelope.for_event("agent-1", seq=0, event=event).sign("wrong-secret")
 
@@ -57,7 +58,7 @@ async def test_verify_rejects_an_unsigned_envelope():
     await db.connect()
     try:
         agents = AgentsRepo(db)
-        await agents.enroll("agent-1")
+        await support.enroll_in_db(db, "agent-1")
         event = FallEvent(camera_id="cam-1")
         envelope = Envelope.for_event("agent-1", seq=0, event=event)  # never signed
 

@@ -1,15 +1,4 @@
-# mantau-core isn't published anywhere yet -- install from the local sibling
-# checkout (one level up now that this is a standalone repo under
-# mantau-prototype/, not nested under mantau-backend-localdevice/). Once it
-# has a remote and tests are green there, switch this to the pinned git SHA
-# documented in mantau-core's own README.
--e ../mantau-core
-# Server inference (POST /agents/{id}/inference) runs the same detector as the
-# agents; without it the server runs and reports inference unavailable.
--e ../mantau-AI
-
--e .
-
-# Dev / test
-pytest>=8.0
-pytest-asyncio>=0.23
+# Standalone development install; private AI checkout requires authorized Git access.
+# Production uses the hashed private wheel and mantau-core.ref in Dockerfile.
+mantau-core[push,detection] @ git+https://github.com/Kita-Ngulang-Foundation/mantau-core.git@dd2c0ee6c3a429e4bf90c462b77d078427c40a90
+-e .[dev]

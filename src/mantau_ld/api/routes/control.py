@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import json
-import time
-import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from mantau_core.contracts import (
-    AgentClaimStatus, CameraRequestMetadata, ClaimStatus, CommandReceipt,
+    CameraRequestMetadata, CommandReceipt,
     CommandResult, CommandState, CommandType, ControlCommand, InferenceMode,
 )
 from pydantic import BaseModel, Field
@@ -15,17 +13,12 @@ from pydantic import BaseModel, Field
 from ...control_auth import authenticated_agent, authenticated_user
 from ...control_crypto import CredentialCipher
 from ...store.cameras_repo import CamerasRepo
-from ...store.control_repo import ClaimRateLimited, ControlRepo, IdempotencyConflict
+from ...store.control_repo import ControlRepo, IdempotencyConflict
 from ...store.identity_repo import UserPrincipal
 from ..deps import get_cameras_repo, get_control_repo
 from .agents import _agent_status
 
 router = APIRouter(tags=["control-plane"])
-
-
-class ClaimRequest(BaseModel):
-    claim_code: str
-    platform: str
 
 
 class CameraCredentialsIn(BaseModel):
@@ -67,38 +60,26 @@ def _cipher(request: Request) -> CredentialCipher:
 async def _queue(request: Request, repo: ControlRepo, principal: UserPrincipal, agent_id: str,
                  command_type: CommandType, payload: dict, idempotency_key: str,
                  encrypted_payload: bytes | None = None) -> CommandReceipt:
-    await _require_owned(repo, principal.household_id, agent_id)
+    if principal.role not in ("owner", "admin"):
+        raise HTTPException(403, "forbidden")
     try:
-        command = await repo.queue(
-            agent_id=agent_id, household_id=principal.household_id,
-            requested_by_user_id=principal.user_id, command_type=command_type,
-            payload=payload, encrypted_payload=encrypted_payload,
-            idempotency_key=idempotency_key, ttl_s=request.app.state.settings.command_ttl_s,
-        )
+        async with request.app.state.db.transaction():
+            membership = await (await request.app.state.db.conn.execute(
+                'SELECT role FROM household_memberships WHERE household_id=? AND user_id=?',
+                (principal.household_id, principal.user_id))).fetchone()
+            if membership is None or membership[0] not in ('owner', 'admin'):
+                raise HTTPException(403, 'forbidden')
+            await _require_owned(repo, principal.household_id, agent_id)
+            command = await repo.queue(
+                agent_id=agent_id, household_id=principal.household_id,
+                requested_by_user_id=principal.user_id, command_type=command_type,
+                payload=payload, encrypted_payload=encrypted_payload,
+                idempotency_key=idempotency_key, ttl_s=request.app.state.settings.command_ttl_s,
+            )
     except IdempotencyConflict as exc:
         raise HTTPException(409, "idempotency_key_conflict") from exc
     return CommandReceipt(command_id=command.command_id, accepted=True,
                           state=CommandState(command.state))
-
-
-@router.post("/agent-claims")
-async def claim_agent(body: ClaimRequest, request: Request,
-                      repo: ControlRepo = Depends(get_control_repo),
-                      principal: UserPrincipal = Depends(authenticated_user)):
-    platform = "linux_x86_64" if body.platform == "linux" else body.platform
-    try:
-        agent_id = await repo.claim(
-            body.claim_code.strip().upper(), user_id=principal.user_id,
-            household_id=principal.household_id, platform=platform,
-            attempt_limit=request.app.state.settings.claim_attempt_limit,
-            attempt_window_s=request.app.state.settings.claim_attempt_window_s,
-        )
-    except ClaimRateLimited as exc:
-        raise HTTPException(429, "claim_rate_limited") from exc
-    if agent_id is None:
-        raise HTTPException(404, "resource_not_found")
-    row = await repo.get_state(principal.household_id, agent_id)
-    return _agent_status(row, request.app.state.settings.agent_offline_after_s)
 
 
 @router.get("/agents/{agent_id}/setup")
@@ -108,9 +89,9 @@ async def setup_status(agent_id: str, request: Request,
     row = await repo.get_state(principal.household_id, agent_id)
     if row is None:
         raise HTTPException(404, "resource_not_found")
-    status = row["setup_status"] or "not_started"
+    status = _agent_status(row, request.app.state.settings.agent_offline_after_s)["setup_status"]
     messages = {
-        "not_started": "Agent is claimed and waiting for setup.",
+        "not_started": "Agent is enrolled and waiting for setup.",
         "waiting_for_agent": "Waiting for the agent to connect.",
         "discovering": "Discovering cameras on the agent LAN.",
         "configuring_camera": "Applying camera configuration.",
@@ -162,12 +143,18 @@ async def configure_camera(agent_id: str, body: CameraCommandRequest, request: R
     metadata = body.camera.model_dump(mode="json")
     metadata["username_present"] = bool(body.credentials.username)
     encrypted = cipher.encrypt(body.credentials.model_dump())
-    receipt = await _queue(request, repo, principal, agent_id, CommandType.CONFIGURE_CAMERA,
-                 metadata, _key(idempotency_key), encrypted)
-    camera = await cameras.create(
-        body.camera.camera_id, body.camera.name,
-        household_id=principal.household_id, agent_id=agent_id,
-    )
+    try:
+        async with request.app.state.db.transaction():
+            receipt = await _queue(request, repo, principal, agent_id, CommandType.CONFIGURE_CAMERA,
+                         metadata, _key(idempotency_key), encrypted)
+            camera = await cameras.create(
+                body.camera.camera_id, body.camera.name,
+                household_id=principal.household_id, agent_id=agent_id,
+            )
+            await request.app.state.db.conn.execute(
+                "UPDATE agents SET last_frame_at=NULL,last_inference_at=NULL WHERE agent_id=?", (agent_id,))
+    except LookupError as exc:
+        raise HTTPException(404, "resource_not_found") from exc
     return {"camera_id": camera.camera_id, "name": camera.name, "agent_id": camera.agent_id,
             **receipt.model_dump(mode="json")}
 
@@ -178,9 +165,9 @@ async def set_inference_mode(agent_id: str, body: InferenceModeRequest, request:
                              repo: ControlRepo = Depends(get_control_repo),
                              principal: UserPrincipal = Depends(authenticated_user)):
     receipt = await _queue(request, repo, principal, agent_id, CommandType.SET_INFERENCE_MODE,
-                 {"mode": body.mode.value}, _key(idempotency_key))
+                 {"mode": InferenceMode.CLOUD.value}, _key(idempotency_key))
     if receipt.state in (CommandState.QUEUED, CommandState.DELIVERED, CommandState.RUNNING):
-        await repo.set_requested_mode(agent_id, body.mode.value)
+        await repo.set_requested_mode(agent_id, InferenceMode.CLOUD.value)
     row = await repo.get_state(principal.household_id, agent_id)
     return {**_agent_status(row, request.app.state.settings.agent_offline_after_s),
             **receipt.model_dump(mode="json")}
@@ -215,34 +202,10 @@ async def reconfigure(agent_id: str, request: Request,
                         {}, _key(idempotency_key))
 
 
-class ClaimCodeOut(BaseModel):
-    claim_code: str
-    expires_at: datetime
-
-
-@router.post("/agent-control/claim-code", response_model=ClaimCodeOut, status_code=201)
-async def refresh_claim_code(request: Request, agent=Depends(authenticated_agent),
-                             repo: ControlRepo = Depends(get_control_repo)):
-    """A fresh single-use claim code for this unclaimed agent. Needs the
-    agent's own credential and never changes it -- unlike rotation, which
-    re-enrolls. A claimed agent never gets another code: moving it to another
-    household requires the current owner to revoke it first."""
-    if agent.household_id is not None:
-        raise HTTPException(409, "agent_already_claimed")
-    ttl_s = request.app.state.settings.claim_code_ttl_s
-    code = await repo.create_claim_code(agent.agent_id, agent.enrollment_id, ttl_s=ttl_s)
-    return ClaimCodeOut(
-        claim_code=code,
-        expires_at=datetime.fromtimestamp(time.time() + ttl_s, timezone.utc),
-    )
-
-
 @router.post("/agent-control/commands/poll", response_model=ControlCommand | None)
 async def poll_commands(body: AgentPollRequest, request: Request, response: Response,
                         agent=Depends(authenticated_agent),
                         repo: ControlRepo = Depends(get_control_repo)):
-    if request.app.state.settings.control_plane_mode == "disabled":
-        raise HTTPException(404, "control_plane_disabled")
     if body.status:
         # The validated status model has no credential-bearing fields; reject
         # obvious mistakes before persistence as a second redaction boundary.

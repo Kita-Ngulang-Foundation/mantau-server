@@ -3,22 +3,14 @@ from __future__ import annotations
 from fastapi.testclient import TestClient
 from mantau_core.contracts import Envelope, EventKind, FallEvent
 
-from mantau_ld.api.app import create_app
-from mantau_ld.config import Settings
+import support
 
-USER = {"X-Mantau-User-ID": "family"}
-OTHER = {"X-Mantau-User-ID": "stranger"}
+USER = support.user("family")
+OTHER = support.user("stranger")
 
 
 def _setup(client):
-    enrolled = client.post("/agents/enroll", json={"agent_id": "agent-1"}).json()
-    assert client.post("/agent-claims", headers=USER, json={
-        "claim_code": enrolled["claim_code"], "platform": "linux",
-    }).status_code == 200
-    assert client.post("/cameras", headers=USER, json={
-        "camera_id": "cam-1", "name": "Kamar Ibu", "agent_id": "agent-1",
-    }).status_code == 201
-    return enrolled["secret"]
+    return support.enroll(client, USER, camera_id="cam-1")["secret"]
 
 
 def _ingest(client, secret, seq, event):
@@ -27,7 +19,7 @@ def _ingest(client, secret, seq, event):
 
 
 def _app(tmp_path):
-    return create_app(Settings(db_path=str(tmp_path / "ev.db"), control_plane_mode="local_dev"))
+    return support.app(support.settings(db_path=str(tmp_path / "ev.db")))
 
 
 def test_event_history_pages_and_filters_by_kind(tmp_path):

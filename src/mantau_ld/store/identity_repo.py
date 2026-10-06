@@ -7,6 +7,7 @@ import uuid
 from dataclasses import dataclass
 
 from .db import Database
+from .transactions import serialized_repository
 
 
 class HouseholdAccessDenied(LookupError):
@@ -45,6 +46,7 @@ class UserPrincipal:
     subject: str
 
 
+@serialized_repository
 class IdentityRepo:
     def __init__(self, db: Database) -> None:
         self._db = db

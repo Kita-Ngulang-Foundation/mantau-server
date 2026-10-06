@@ -14,6 +14,7 @@ never stored: it is decoded in memory and dropped.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from mantau_core.contracts import InferenceCapability, InferenceResult
@@ -112,17 +113,32 @@ async def infer(
         raise HTTPException(401, "unauthorized")
     if await cameras.get_for_agent(agent_id, camera_id) is None:
         raise HTTPException(404, "resource_not_found")
+    await agents.touch(agent_id)
+    async def failed_processing():
+        async with request.app.state.db.serialized():
+            await request.app.state.db.conn.execute(
+                "UPDATE agents SET last_inference_at=NULL WHERE agent_id=?", (agent_id,))
+            await request.app.state.db.conn.commit()
     if not service.available:
+        await failed_processing()
         raise HTTPException(503, "inference_unavailable")
 
-    # A retry of an answered frame gets the stored answer, even if the frame
-    # has since become too old to process.
+    request_hash = hashlib.sha256(x_mantau_signature.encode()).hexdigest()
+    try:
+        durable_answer = await results.answered(agent_id, frame_id, request_hash)
+    except ValueError as exc:
+        raise HTTPException(409, 'frame_id_conflict') from exc
+    if durable_answer is not None:
+        return durable_answer
     cached = service.answered(agent_id, frame_id)
     if cached is not None:
         return cached
 
     now_ms = datetime.now(timezone.utc).timestamp() * 1000
-    if now_ms - captured_at_ms > settings.inference_max_frame_age_s * 1000:
+    pending_computation = service.pending_computation(agent_id, frame_id)
+    if pending_computation is not None and pending_computation[0] != request_hash:
+        raise HTTPException(409, 'frame_id_conflict')
+    if pending_computation is None and now_ms - captured_at_ms > settings.inference_max_frame_age_s * 1000:
         raise HTTPException(422, "stale_frame")
     if captured_at_ms - now_ms > settings.inference_max_clock_skew_s * 1000:
         raise HTTPException(422, "clock_skew")
@@ -139,30 +155,53 @@ async def infer(
         owners = {event_id: await events.agent_for(event_id) for event_id in event_ids}
         foreign = {e for e, owner in owners.items() if owner is not None and owner != agent_id}
         try:
-            result = await service.infer(
-                agent_id=agent_id, camera_id=camera_id, session_id=session_id,
-                frame_id=frame_id, ts_ms=ts_ms, captured_at=captured_at,
-                event_ids=tuple(e for e in event_ids if e not in foreign), jpeg=body,
-                settings=camera_settings)
+            result = service.computation(agent_id, frame_id, request_hash)
+            if result is None:
+                try:
+                    result = await service.infer(
+                        agent_id=agent_id, camera_id=camera_id, session_id=session_id,
+                        frame_id=frame_id, ts_ms=ts_ms, captured_at=captured_at,
+                        event_ids=tuple(e for e in event_ids if e not in foreign), jpeg=body,
+                        settings=camera_settings)
+                    if foreign:
+                        result = result.model_copy(update={'confirmations': [
+                            *result.confirmations,
+                            *(contract.InferenceConfirmation(event_id=e, confirmed=False, confidence=0.0,
+                              reason='unknown_event') for e in sorted(foreign))]})
+                    service.retain_computation(agent_id, frame_id, request_hash, result)
+                except BaseException:
+                    service.complete_computation(agent_id, frame_id)
+                    raise
+        except ValueError as exc:
+            raise HTTPException(409, 'frame_id_conflict') from exc
         except InferenceUnavailable as exc:
+            await failed_processing()
             raise HTTPException(503, "inference_unavailable") from exc
         except CapacityExceeded as exc:
+            await failed_processing()
             raise HTTPException(503, "inference_capacity") from exc
         except RateLimited as exc:
             raise HTTPException(429, "rate_limited") from exc
         except UndecodableFrame as exc:
+            await failed_processing()
             raise HTTPException(422, "undecodable_frame") from exc
-        for event in result.events:
-            await dispatcher.dispatch(event, household_id=household_id, agent_id=agent_id)
-        for confirmation in result.confirmations:
-            await results.save_confirmation(confirmation, frame_id=frame_id,
-                                            agent_id=agent_id, household_id=household_id)
-        if foreign:
-            result = result.model_copy(update={"confirmations": [
-                *result.confirmations,
-                *(contract.InferenceConfirmation(event_id=e, confirmed=False, confidence=0.0,
-                                                 reason="unknown_event") for e in sorted(foreign)),
-            ]})
+        async with request.app.state.db.transaction():
+            if await cameras.get_for_agent(agent_id, camera_id) is None:
+                raise HTTPException(404, "resource_not_found")
+            if result.processed:
+                await request.app.state.db.conn.execute(
+                    "UPDATE agents SET last_frame_at=?,last_inference_at=? WHERE agent_id=?",
+                    (captured_at.timestamp(), datetime.now(timezone.utc).timestamp(), agent_id))
+            else:
+                await failed_processing()
+            for event in result.events:
+                await dispatcher.dispatch(event, household_id=household_id, agent_id=agent_id, deliver=False)
+            for confirmation in result.confirmations:
+                await results.save_confirmation(confirmation, frame_id=frame_id,
+                                                agent_id=agent_id, household_id=household_id)
+            await results.save_answer(agent_id, camera_id, household_id, request_hash, result)
+        service.complete_computation(agent_id, frame_id)
+        await dispatcher.outbox.deliver_pending()
         return result
 
     return await service.once(agent_id, frame_id, work)

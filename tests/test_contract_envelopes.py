@@ -1,5 +1,5 @@
 """The "server accepts" half of the wire contract: an envelope shaped
-exactly like `../../protocol/examples/fall_event_envelope.json` (same field
+exactly like `protocol/examples/fall_event_envelope.json` (same field
 names, same payload shape, same signing scheme) must be accepted by a real
 enrolled agent's `/ingest` call.
 
@@ -22,12 +22,11 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 from mantau_core.contracts import Envelope, EventKind, FallEvent, Heartbeat, Severity
 
-from mantau_ld.api.app import create_app
-from mantau_ld.config import Settings
+import support
 
-EXAMPLES_DIR = Path(__file__).resolve().parents[2] / "protocol" / "examples"
+EXAMPLES_DIR = Path(__file__).resolve().parents[1] / "protocol" / "examples"
 FIXED_TIME = datetime(2026, 9, 13, 4, 12, 3, 114000, tzinfo=timezone.utc)
-USER = {"X-Mantau-User-ID": "fixture-user"}
+USER = support.user("fixture-user")
 
 
 def _load(name: str) -> dict:
@@ -35,21 +34,13 @@ def _load(name: str) -> dict:
 
 
 def _enroll_claim_camera(client: TestClient, camera_id: str) -> str:
-    enrolled = client.post("/agents/enroll", json={"agent_id": "agent-1"}).json()
-    assert client.post("/agent-claims", headers=USER, json={
-        "claim_code": enrolled["claim_code"], "platform": "linux",
-    }).status_code == 200
-    assert client.post("/cameras", headers=USER, json={
-        "camera_id": camera_id, "name": camera_id, "agent_id": "agent-1",
-    }).status_code == 201
-    return enrolled["secret"]
+    return support.enroll(client, USER, camera_id=camera_id, camera_name=camera_id)["secret"]
 
 
 def test_server_accepts_a_fall_event_shaped_like_the_golden_fixture():
     golden = _load("fall_event_envelope.json")["payload"]
 
-    settings = Settings(db_path=":memory:", control_plane_mode="local_dev")
-    with TestClient(create_app(settings)) as client:
+    with support.client() as client:
         secret = _enroll_claim_camera(client, golden["camera_id"])
 
         event = FallEvent(
@@ -72,8 +63,7 @@ def test_server_accepts_a_fall_event_shaped_like_the_golden_fixture():
 def test_server_accepts_a_heartbeat_shaped_like_the_golden_fixture():
     golden = _load("heartbeat_envelope.json")["payload"]
 
-    settings = Settings(db_path=":memory:", control_plane_mode="local_dev")
-    with TestClient(create_app(settings)) as client:
+    with support.client() as client:
         secret = _enroll_claim_camera(client, golden["camera_id"])
 
         heartbeat = Heartbeat(
@@ -86,5 +76,5 @@ def test_server_accepts_a_heartbeat_shaped_like_the_golden_fixture():
         r = client.post("/ingest", json=envelope.model_dump(mode="json"))
         assert r.status_code == 200
 
-        ready = client.get("/ready").json()
-        assert ready["agents"]["agent-1"]["camera_reachable"] == golden["camera_reachable"]
+        agent = client.get("/agents", headers=USER).json()[0]
+        assert agent["last_heartbeat_at"] is not None

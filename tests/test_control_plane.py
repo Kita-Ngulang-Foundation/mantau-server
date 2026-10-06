@@ -5,31 +5,26 @@ import sqlite3
 from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
 
+import support
 from mantau_ld.api.app import create_app
-from mantau_ld.config import Settings
 
 
-USER = {"X-Mantau-User-ID": "user-a"}
-OTHER = {"X-Mantau-User-ID": "user-b"}
+USER = support.user("user-a")
+OTHER = support.user("user-b")
 
 
 def _settings(tmp_path, **overrides):
     values = dict(
-        db_path=str(tmp_path / "control.db"), control_plane_mode="local_dev",
+        db_path=str(tmp_path / "control.db"),
         control_plane_encryption_key=Fernet.generate_key().decode("ascii"),
         command_delivery_lease_s=0,
     )
     values.update(overrides)
-    return Settings(**values)
+    return support.settings(**values)
 
 
 def _enroll_and_claim(client: TestClient):
-    enrolled = client.post("/agents/enroll", json={"agent_id": "agent-1"}).json()
-    claimed = client.post("/agent-claims", headers=USER, json={
-        "claim_code": enrolled["claim_code"], "platform": "raspberry_pi",
-    })
-    assert claimed.status_code == 200
-    return enrolled
+    return support.enroll(client, USER, platform="raspberry_pi")
 
 
 def _agent_headers(enrolled):
@@ -37,20 +32,19 @@ def _agent_headers(enrolled):
             "X-Mantau-Agent-Secret": enrolled["secret"]}
 
 
-def test_claims_are_owned_and_control_requests_require_identity(tmp_path):
-    with TestClient(create_app(_settings(tmp_path))) as client:
+def test_agents_are_owned_and_control_requests_require_identity(tmp_path):
+    with TestClient(support.app(_settings(tmp_path))) as client:
         enrolled = _enroll_and_claim(client)
         assert client.get("/agents").status_code == 401
         assert [a["agent_id"] for a in client.get("/agents", headers=USER).json()] == ["agent-1"]
         assert client.get("/agents", headers=OTHER).json() == []
         assert client.get("/agents/agent-1/setup", headers=OTHER).status_code == 404
-        assert client.post("/agent-claims", headers=OTHER, json={
-            "claim_code": enrolled["claim_code"], "platform": "linux",
-        }).status_code == 404
+        assert client.delete("/agents/agent-1", headers=OTHER).status_code == 404
+        assert enrolled["agent_id"] == "agent-1"
 
 
 def test_command_retry_delivery_restart_and_agent_return(tmp_path):
-    with TestClient(create_app(_settings(tmp_path))) as client:
+    with TestClient(support.app(_settings(tmp_path))) as client:
         enrolled = _enroll_and_claim(client)
         url = "/agents/agent-1/commands/restart"
         first = client.post(url, headers={**USER, "Idempotency-Key": "restart-once"})
@@ -60,13 +54,13 @@ def test_command_retry_delivery_restart_and_agent_return(tmp_path):
                                headers={**USER, "Idempotency-Key": "restart-once"})
         assert conflict.status_code == 409
 
-        # It starts offline, then authenticated polling marks it online.
+        # Contact alone proves connection; protection needs processed frames.
         assert client.get("/agents", headers=USER).json()[0]["health_state"] == "offline"
         polled = client.post("/agent-control/commands/poll", headers=_agent_headers(enrolled),
                              json={"status": {"health_state": "online"}})
         assert polled.status_code == 200
         assert polled.json()["command_type"] == "restart"
-        assert client.get("/agents", headers=USER).json()[0]["health_state"] == "online"
+        assert client.get("/agents", headers=USER).json()[0]["health_state"] == "degraded"
 
         command_id = polled.json()["command_id"]
         result = {"schema_version": 1, "command_id": command_id, "state": "succeeded",
@@ -79,7 +73,7 @@ def test_command_retry_delivery_restart_and_agent_return(tmp_path):
 
 
 def test_agent_status_and_results_reject_secret_material(tmp_path):
-    with TestClient(create_app(_settings(tmp_path))) as client:
+    with TestClient(support.app(_settings(tmp_path))) as client:
         enrolled = _enroll_and_claim(client)
         agent_headers = _agent_headers(enrolled)
         assert client.post("/agent-control/commands/poll", headers=agent_headers,
@@ -94,7 +88,7 @@ def test_agent_status_and_results_reject_secret_material(tmp_path):
 
 
 def test_expired_commands_are_not_delivered(tmp_path):
-    with TestClient(create_app(_settings(tmp_path, command_ttl_s=0))) as client:
+    with TestClient(support.app(_settings(tmp_path, command_ttl_s=0))) as client:
         enrolled = _enroll_and_claim(client)
         queued = client.post("/agents/agent-1/commands/reconfigure",
                              headers={**USER, "Idempotency-Key": "expires"})
@@ -108,7 +102,7 @@ def test_expired_commands_are_not_delivered(tmp_path):
 def test_camera_credentials_are_encrypted_redacted_and_deleted_on_ack(tmp_path):
     password = "camera-password-never-store-plain"
     settings = _settings(tmp_path)
-    with TestClient(create_app(settings)) as client:
+    with TestClient(support.app(settings)) as client:
         enrolled = _enroll_and_claim(client)
         body = {
             "camera": {"name": "Room", "camera_id": "cam-1", "host": "192.0.2.10",
@@ -139,16 +133,15 @@ def test_camera_credentials_are_encrypted_redacted_and_deleted_on_ack(tmp_path):
             assert db.execute("SELECT encrypted_payload FROM queued_commands").fetchone()[0] is None
 
 
-def test_production_mode_fails_closed_without_auth_configuration(tmp_path):
-    settings = _settings(tmp_path, control_plane_mode="production",
-                         control_plane_auth_tokens_json="{}")
+def test_user_routes_fail_closed_without_a_firebase_project(tmp_path):
+    settings = _settings(tmp_path, firebase_project_id="", fcm_project_id=None)
     with TestClient(create_app(settings)) as client:
-        assert client.get("/agents").status_code == 503
+        assert client.get("/agents", headers=USER).status_code == 503
 
 
 def test_running_command_recovers_after_restart_and_results_are_owner_scoped(tmp_path):
     settings = _settings(tmp_path)
-    with TestClient(create_app(settings)) as client:
+    with TestClient(support.app(settings)) as client:
         enrolled = _enroll_and_claim(client)
         receipt = client.post('/agents/agent-1/camera-tests', headers={**USER, 'Idempotency-Key': 'recover'}, json={
             'camera': {'name': 'Room', 'host': '192.0.2.1'},
@@ -163,7 +156,7 @@ def test_running_command_recovers_after_restart_and_results_are_owner_scoped(tmp
     # A real server restart, with the acknowledged command still in flight.
     with sqlite3.connect(tmp_path / 'control.db') as db:
         db.execute('UPDATE queued_commands SET expires_at=0')
-    with TestClient(create_app(settings)) as client:
+    with TestClient(support.app(settings)) as client:
         command = client.post('/agent-control/commands/poll', headers=headers, json={}).json()
         assert command['command_id'] == command_id
         assert 'password' not in command['payload']  # retained only by agent's encrypted ledger
@@ -179,7 +172,7 @@ def test_running_command_recovers_after_restart_and_results_are_owner_scoped(tmp
 
 
 def test_invalid_camera_request_does_not_echo_secrets(tmp_path):
-    with TestClient(create_app(_settings(tmp_path))) as client:
+    with TestClient(support.app(_settings(tmp_path))) as client:
         _enroll_and_claim(client)
         response = client.post('/agents/agent-1/camera-tests', headers={**USER, 'Idempotency-Key': 'invalid'}, json={
             'camera': {'host': '192.0.2.1'},

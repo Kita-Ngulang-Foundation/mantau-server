@@ -122,8 +122,12 @@ async def test_legacy_database_expands_and_backfills_durable_ownership(tmp_path)
         assert await (await db.conn.execute(
             "SELECT 1 FROM schema_migrations WHERE version=2"
         )).fetchone()
+        # v4: the claim tables are gone; agents join with enrollment keys.
         assert await (await db.conn.execute(
-            "SELECT 1 FROM claim_codes WHERE code='legacy-code'"
+            "SELECT 1 FROM sqlite_master WHERE name='claim_codes'"
+        )).fetchone() is None
+        assert await (await db.conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE version=4"
         )).fetchone()
 
         agent_fks = await (await db.conn.execute("PRAGMA foreign_key_list(agents)")).fetchall()

@@ -6,28 +6,23 @@ import hmac
 from fastapi.testclient import TestClient
 from mantau_core.contracts import Envelope, EventKind, FallEvent
 
-from mantau_ld.api.app import create_app
-from mantau_ld.config import Settings
+import support
 
-OWNER = {"X-Mantau-User-ID": "family"}
-STRANGER = {"X-Mantau-User-ID": "stranger"}
+OWNER = support.user("family")
+STRANGER = support.user("stranger")
 MP4 = b"\x00\x00\x00\x18ftypmp42" + b"x" * 64
 
 
 def _app(tmp_path, **overrides):
-    return create_app(Settings(
-        db_path=str(tmp_path / "s.db"), control_plane_mode="local_dev",
+    return support.app(support.settings(
+        db_path=str(tmp_path / "s.db"),
         recordings_dir=str(tmp_path / "recordings"), **overrides,
     ))
 
 
 def _setup(client, agent_id="agent-1", camera_id="cam-1", user=OWNER):
-    enrolled = client.post("/agents/enroll", json={"agent_id": agent_id}).json()
-    client.post("/agent-claims", headers=user,
-                json={"claim_code": enrolled["claim_code"], "platform": "linux"})
-    client.post("/cameras", headers=user,
-                json={"camera_id": camera_id, "name": "Kamar", "agent_id": agent_id})
-    return enrolled["secret"]
+    return support.enroll(client, user, agent_id=agent_id, camera_id=camera_id,
+                          camera_name="Kamar")["secret"]
 
 
 def _agent(agent_id, secret):

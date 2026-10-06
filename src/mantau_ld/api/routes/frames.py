@@ -51,31 +51,39 @@ async def push_frame(
     request: Request,
     x_mantau_agent: str = Header(...),
     x_mantau_signature: str = Header(...),
+    x_mantau_captured_at: int | None = Header(None),
     agents: AgentsRepo = Depends(get_agents_repo),
     cameras: CamerasRepo = Depends(get_cameras_repo),
     frames: FrameStore = Depends(get_frames),
 ) -> Response:
     body = await read_limited(request, request.app.state.settings.frame_max_bytes)
     await _verify(camera_id, body, x_mantau_agent, x_mantau_signature, agents)
-    agent = await agents.get(x_mantau_agent)
-    camera = await cameras.get_for_agent(x_mantau_agent, camera_id)
-    if agent is None or camera is None or agent.household_id is None:
-        raise HTTPException(401, "unauthorized")
-    frames.put(
-        camera_id, body, household_id=agent.household_id, agent_id=x_mantau_agent
-    )
-    return Response(status_code=204)
+    async with request.app.state.db.serialized():
+        agent = await agents.get(x_mantau_agent)
+        camera = await cameras.get_for_agent(x_mantau_agent, camera_id)
+        if agent is None or agent.revoked_at is not None or camera is None or agent.household_id is None:
+            raise HTTPException(401, "unauthorized")
+        frames.put(
+            camera_id, body, household_id=agent.household_id, agent_id=x_mantau_agent,
+            captured_at_ms=x_mantau_captured_at,
+        )
+    # Tells the agent whether anyone is watching, so it sends video-rate
+    # frames only while a family member has the live view open.
+    return Response(status_code=204,
+                    headers={"X-Mantau-Live-Viewers": str(frames.viewers(camera_id))})
 
 
 @router.get("/cameras/{camera_id}/snapshot.jpg")
 async def snapshot(
     camera_id: str,
+    request: Request,
     frames: FrameStore = Depends(get_frames),
     cameras: CamerasRepo = Depends(get_cameras_repo),
     principal: UserPrincipal = Depends(authenticated_user),
 ) -> Response:
     if await cameras.get_for_household(principal.household_id, camera_id) is None:
         raise HTTPException(404, "resource_not_found")
+    frames.snapshot_requested(camera_id)
     frame = frames.latest(camera_id, household_id=principal.household_id)
     if frame is None:
         raise HTTPException(404, "resource_not_found")
@@ -91,6 +99,7 @@ async def snapshot(
 @router.get("/cameras/{camera_id}/live.mjpeg")
 async def live(
     camera_id: str,
+    request: Request,
     frames: FrameStore = Depends(get_frames),
     cameras: CamerasRepo = Depends(get_cameras_repo),
     principal: UserPrincipal = Depends(authenticated_user),
@@ -99,25 +108,34 @@ async def live(
         raise HTTPException(404, "resource_not_found")
 
     async def stream():
-        # Start from whatever is already current: a viewer opening a stream on
-        # a live camera must not stare at nothing until the next push happens.
+        with frames.watching(camera_id):
+            async for part in _parts():
+                yield part
+
+    async def authorized():
+        async with request.app.state.db.serialized():
+            member = await (await request.app.state.db.conn.execute(
+                'SELECT 1 FROM household_memberships WHERE household_id=? AND user_id=?',
+                (principal.household_id, principal.user_id))).fetchone()
+        camera = await cameras.get_for_household(principal.household_id, camera_id)
+        return member is not None and camera is not None
+
+    async def _parts():
         current = frames.latest(camera_id, household_id=principal.household_id)
-        while True:
+        while await authorized():
             if current is not None:
                 jpeg = current.jpeg
                 yield (
-                    f"--{_BOUNDARY}\r\nContent-Type: image/jpeg\r\n"
-                    f"Content-Length: {len(jpeg)}\r\n\r\n"
-                ).encode() + jpeg + b"\r\n"
-            nxt = await frames.wait_for_next(
-                camera_id, household_id=principal.household_id,
-                timeout_s=_STREAM_IDLE_TIMEOUT_S,
-            )
-            # On idle timeout, re-send what we have rather than going silent --
-            # keeps the connection (and any proxy in front of it) alive.
-            current = nxt if nxt is not None else frames.latest(
-                camera_id, household_id=principal.household_id
-            )
+                    f'--{_BOUNDARY}\r\nContent-Type: image/jpeg\r\n'
+                    f'Content-Length: {len(jpeg)}\r\n\r\n'
+                ).encode() + jpeg + b'\r\n'
+            current = await frames.wait_for_next(
+                camera_id, household_id=principal.household_id, timeout_s=2)
+            if current is None:
+                if not frames.is_live(camera_id):
+                    return
+                # A boundary keeps intermediaries alive without replaying a JPEG.
+                yield f'--{_BOUNDARY}\r\n'.encode()
 
     return StreamingResponse(
         stream(),

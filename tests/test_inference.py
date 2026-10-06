@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import time
 import uuid
+import asyncio
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -20,11 +22,10 @@ from mantau_core.activity import FrameObservation, Perception, PersonObservation
 from mantau_core.contracts import Envelope, FallEvent
 from mantau_core.contracts import inference as contract
 
-from mantau_ld.api.app import create_app
-from mantau_ld.config import Settings
+import support
 
-USER_A = {"X-Mantau-User-ID": "user-a"}
-USER_B = {"X-Mantau-User-ID": "user-b"}
+USER_A = support.user("user-a")
+USER_B = support.user("user-b")
 
 
 class FakeDetector:
@@ -68,18 +69,13 @@ def _client(**overrides) -> TestClient:
     FakeDetector.instances = []
     # Tests upload back to back; only the rate-limit test keeps a real fps cap.
     overrides.setdefault("inference_max_fps", 10_000.0)
-    settings = Settings(db_path=":memory:", control_plane_mode="local_dev", **overrides)
-    return TestClient(create_app(settings, inference_factory=FakeDetector,
-                                 inference_decoder=_decode))
+    return support.client(support.settings(**overrides), inference_factory=FakeDetector,
+                          inference_decoder=_decode)
 
 
 def _setup(client: TestClient, agent_id="agent-a", camera_id="cam-a", user=USER_A) -> str:
-    enrolled = client.post("/agents/enroll", json={"agent_id": agent_id}).json()
-    assert client.post("/agent-claims", headers=user, json={
-        "claim_code": enrolled["claim_code"], "platform": "linux_x86_64"}).status_code == 200
-    assert client.post("/cameras", headers=user, json={
-        "camera_id": camera_id, "name": "Room", "agent_id": agent_id}).status_code == 201
-    return enrolled["secret"]
+    return support.enroll(client, user, agent_id=agent_id, camera_id=camera_id,
+                          camera_name="Room")["secret"]
 
 
 def _now_ms() -> int:
@@ -131,8 +127,7 @@ def test_capability_reports_unavailable_detector_and_endpoint_refuses():
     def broken(*args):
         raise ImportError("no mantau")
 
-    app = create_app(Settings(db_path=":memory:", control_plane_mode="local_dev"),
-                     inference_factory=broken, inference_decoder=_decode)
+    app = support.app(support.settings(), inference_factory=broken, inference_decoder=_decode)
     with TestClient(app) as client:
         cap = client.get("/inference/capability").json()
         assert cap["available"] is False and "ImportError" in cap["reason"]
@@ -194,10 +189,9 @@ def test_live_frame_signature_is_not_accepted():
         assert r.status_code == 401
 
 
-def test_unclaimed_and_revoked_agents_are_refused():
+def test_unknown_and_revoked_agents_are_refused():
     with _client() as client:
-        unclaimed = client.post("/agents/enroll", json={"agent_id": "agent-u"}).json()
-        assert _upload(client, unclaimed["secret"], agent_id="agent-u",
+        assert _upload(client, "never-enrolled", agent_id="agent-u",
                        camera_id="cam-u").status_code == 401
         secret = _setup(client)
         assert client.delete("/agents/agent-a", headers=USER_A).status_code in (200, 204)
@@ -252,6 +246,114 @@ def test_retried_frame_runs_the_detector_once_and_alerts_once():
         assert len(client.get("/events", headers=USER_A).json()) == 1
 
 
+async def _inference_sql(app, sql):
+    async with app.state.db.serialized():
+        cursor = await app.state.db.conn.execute(sql)
+        rows = await cursor.fetchall()
+        await app.state.db.conn.commit()
+        return [dict(row) for row in rows]
+
+
+def _inference_query(client, sql):
+    return client.portal.call(_inference_sql, client.app, sql)
+
+
+@pytest.mark.parametrize("table", ["events", "inference_answers"])
+def test_failed_durable_write_retries_exact_computed_fall_and_stores_once(tmp_path, table):
+    with _client(db_path=str(tmp_path / "inference-retry.db")) as client:
+        secret = _setup(client)
+        support.register_device(client, USER_A, device_id="phone", token="caregiver-token")
+        captured = _now_ms()
+        _inference_query(client, f"CREATE TRIGGER fail_inference_write BEFORE INSERT ON {table} "
+                                "BEGIN SELECT RAISE(ABORT,'temporary inference storage failure'); END")
+        with pytest.raises(sqlite3.IntegrityError, match="temporary inference storage failure"):
+            _upload(client, secret, b"fall", frame_id="retry-fall", captured_at_ms=captured)
+        computed = client.app.state.inference.pending_computation("agent-a", "retry-fall")[1]
+        event_id = computed.events[0].event_id
+        for table_name in ("events", "push_outbox", "inference_answers"):
+            assert _inference_query(client, f"SELECT * FROM {table_name}") == []
+        _inference_query(client, "DROP TRIGGER fail_inference_write")
+        retried = _upload(client, secret, b"fall", frame_id="retry-fall", captured_at_ms=captured)
+        assert retried.status_code == 200, retried.text
+        assert retried.json()["processed"] is True
+        assert retried.json()["events"][0]["event_id"] == event_id
+        duplicate = _upload(client, secret, b"fall", frame_id="retry-fall", captured_at_ms=captured)
+        assert duplicate.status_code == 200 and duplicate.json()["duplicate"] is True
+        assert duplicate.json()["events"] == retried.json()["events"]
+        assert _streams()[0].frames == [1000]
+        assert _inference_query(client, "SELECT event_id FROM events") == [{"event_id": event_id}]
+        assert len(_inference_query(client, "SELECT * FROM push_outbox")) == 1
+        assert len(_inference_query(client, "SELECT * FROM inference_answers")) == 1
+        assert client.app.state.inference.pending_computation("agent-a", "retry-fall") is None
+
+
+def test_alert_bearing_answer_survives_restart_without_new_detector_event(tmp_path):
+    db_path = str(tmp_path / "durable-inference-answer.db")
+    captured = _now_ms()
+    with _client(db_path=db_path) as client:
+        secret = _setup(client)
+        first = _upload(client, secret, b"fall", frame_id="durable-fall", captured_at_ms=captured)
+        assert first.status_code == 200
+        first_result = first.json()
+        assert len(_inference_query(client, "SELECT * FROM inference_answers")) == 1
+    with _client(db_path=db_path) as client:
+        again = _upload(client, secret, b"fall", frame_id="durable-fall", captured_at_ms=captured)
+        assert again.status_code == 200 and again.json()["duplicate"] is True
+        assert again.json()["events"] == first_result["events"]
+        assert _streams() == []
+        assert len(client.get("/events", headers=USER_A).json()) == 1
+        conflict = _upload(client, secret, b"standing", frame_id="durable-fall", captured_at_ms=captured)
+        assert conflict.status_code == 409 and conflict.json()["detail"] == "frame_id_conflict"
+
+
+def test_cancelled_inference_caller_does_not_cancel_event_persistence(tmp_path):
+    from mantau_ld.inference.service import InferenceService
+    from mantau_ld.store.db import Database
+    from mantau_ld.store.events_repo import EventsRepo
+    from mantau_ld.store.inference_repo import InferenceRepo
+    from mantau_ld.store.cameras_repo import CamerasRepo
+
+    async def scenario():
+        db = Database(str(tmp_path / "cancelled-inference.db"))
+        await db.connect()
+        service = InferenceService(support.settings(inference_max_fps=10_000),
+                                   factory=FakeDetector, decoder=_decode)
+        await service.start()
+        try:
+            await support.enroll_in_db(db, "agent-a", household_id="family")
+            await CamerasRepo(db).create("cam-a", "Room", household_id="family", agent_id="agent-a")
+            computed, allow_persistence = asyncio.Event(), asyncio.Event()
+            events, answers = EventsRepo(db), InferenceRepo(db)
+
+            async def work():
+                result = await service.infer(agent_id="agent-a", camera_id="cam-a", session_id="s1",
+                                             frame_id="cancelled-caller", ts_ms=1000,
+                                             captured_at=datetime.now(timezone.utc), event_ids=(), jpeg=b"fall")
+                computed.set()
+                await allow_persistence.wait()
+                async with db.transaction():
+                    await events.insert(result.events[0], household_id="family", agent_id="agent-a")
+                    await answers.save_answer("agent-a", "cam-a", "family", "request-hash", result)
+                return result
+
+            caller = asyncio.create_task(service.once("agent-a", "cancelled-caller", work))
+            await asyncio.wait_for(computed.wait(), 3)
+            caller.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await caller
+            allow_persistence.set()
+            result = await asyncio.wait_for(service.once("agent-a", "cancelled-caller", work), 3)
+            assert result.duplicate is True and len(result.events) == 1
+            stored = await events.records("family")
+            assert len(stored) == 1 and stored[0].event.event_id == result.events[0].event_id
+            durable = await answers.answered("agent-a", "cancelled-caller", "request-hash")
+            assert durable.events == result.events
+        finally:
+            await service.close()
+            await db.close()
+    asyncio.run(scenario())
+
+
 def test_answered_frame_is_returned_even_after_it_went_stale():
     with _client(inference_max_frame_age_s=1.0) as client:
         secret = _setup(client)
@@ -304,6 +406,119 @@ def test_detector_clock_is_the_capture_time():
         _upload(client, secret, captured_at_ms=captured)
         clock_value = _streams()[0].clock()
         assert abs(clock_value.timestamp() * 1000 - captured) < 2
+
+
+@pytest.mark.parametrize("fall,zones,allowed", [
+    ({"enabled": False}, [], False),
+    ({"min_confidence": 0.9}, [], False),
+    ({"min_confidence": 0.87}, [], True),
+    ({}, [{"zone_id": "ignored", "kind": "excluded", "polygon": [
+        {"x": 0.3, "y": 0.7}, {"x": 0.5, "y": 0.7},
+        {"x": 0.5, "y": 0.9}, {"x": 0.3, "y": 0.9}]}], False),
+    ({}, [{"zone_id": "elsewhere", "kind": "excluded", "polygon": [
+        {"x": 0.1, "y": 0.1}, {"x": 0.2, "y": 0.1},
+        {"x": 0.2, "y": 0.2}, {"x": 0.1, "y": 0.2}]}], True),
+])
+def test_saved_fall_policy_controls_actual_events_and_history(fall, zones, allowed):
+    with _client() as client:
+        secret = _setup(client)
+        saved = client.put("/cameras/cam-a/detection-settings", headers=USER_A,
+                           json={"version": 1, "fall": fall, "zones": zones})
+        assert saved.status_code == 200, saved.text
+        result = _upload(client, secret, b"fall")
+        assert result.status_code == 200, result.text
+        assert len(result.json()["events"]) == int(allowed)
+        assert len(client.get("/events", headers=USER_A).json()) == int(allowed)
+        # Editing the policy takes effect in an existing detector session.
+        reset = client.put("/cameras/cam-a/detection-settings", headers=USER_A,
+                           json={"version": saved.json()["settings"]["version"]})
+        assert reset.status_code == 200, reset.text
+        assert len(_upload(client, secret, b"fall", ts_ms=2000).json()["events"]) == 1
+
+
+@pytest.mark.parametrize("missing", ["track", "observation"])
+def test_fall_with_unknown_geometry_cannot_bypass_exclusions(missing):
+    class MissingGeometryDetector(FakeDetector):
+        def perceive(self, image, ts_ms):
+            result = super().perceive(image, ts_ms)
+            return Perception(
+                events=[event.model_copy(update={"track_id": 99}) if missing == "track"
+                        else event for event in result.events],
+                observation=None if missing == "observation" else result.observation)
+
+    with TestClient(support.app(support.settings(inference_max_fps=10_000),
+                               inference_factory=MissingGeometryDetector,
+                               inference_decoder=_decode)) as client:
+        secret = _setup(client)
+        saved = client.put("/cameras/cam-a/detection-settings", headers=USER_A, json={
+            "version": 1, "zones": [{"zone_id": "ignored", "kind": "excluded",
+                "polygon": [{"x": 0, "y": 0}, {"x": 1, "y": 0},
+                            {"x": 1, "y": 1}, {"x": 0, "y": 1}]}]})
+        assert saved.status_code == 200, saved.text
+        result = _upload(client, secret, b"fall")
+        assert result.status_code == 200, result.text
+        assert result.json()["events"] == []
+        assert client.get("/events", headers=USER_A).json() == []
+
+
+@pytest.mark.parametrize("confirmation", [False, True])
+def test_runtime_detector_failure_closes_session_and_fresh_frame_recovers(confirmation):
+    FakeDetector.instances = []
+
+    class FailingDetector(FakeDetector):
+        def perceive(self, image, ts_ms):
+            if image == b"runtime-failure":
+                raise RuntimeError("private detector path must not escape")
+            return super().perceive(image, ts_ms)
+
+    with TestClient(support.app(support.settings(inference_max_fps=10_000),
+                               inference_factory=FailingDetector,
+                               inference_decoder=_decode)) as client:
+        secret = _setup(client)
+        assert _upload(client, secret).status_code == 200
+        event_ids = ("pending-event",) if confirmation else ()
+        if confirmation:
+            assert _upload(client, secret, b"lying", ts_ms=2000,
+                           event_ids=event_ids).status_code == 200
+        failed = _upload(client, secret, b"runtime-failure", ts_ms=3000,
+                         frame_id="failed-frame", event_ids=event_ids)
+        assert failed.status_code == 503
+        assert "private detector path" not in failed.text
+        old = _streams().copy()
+        assert all(detector.closed for detector in old)
+        assert client.app.state.inference.session_count == 0
+        # No successful result was cached for the failed request.
+        assert client.app.state.inference.answered("agent-a", "failed-frame") is None
+        recovered = _upload(client, secret, b"fall", ts_ms=4000,
+                            event_ids=event_ids)
+        assert recovered.status_code == 200, recovered.text
+        assert recovered.json()["processed"] is True
+        if confirmation:
+            assert recovered.json()["confirmations"][0]["confirmed"] is True
+        else:
+            assert len(recovered.json()["events"]) == 1
+        assert len(_streams()) == len(old) + 1
+        assert not _streams()[-1].closed
+
+
+def test_detector_constructor_failure_can_recover_without_reenrollment():
+    fail_next = True
+
+    def factory(camera_id, config, clock):
+        nonlocal fail_next
+        if camera_id != "probe" and fail_next:
+            fail_next = False
+            raise RuntimeError("temporary model-loading failure")
+        return FakeDetector(camera_id, config, clock)
+
+    with TestClient(support.app(support.settings(inference_max_fps=10_000),
+                               inference_factory=factory, inference_decoder=_decode)) as client:
+        secret = _setup(client)
+        assert _upload(client, secret).status_code == 503
+        assert client.app.state.inference.session_count == 0
+        recovered = _upload(client, secret, b"fall", ts_ms=2000)
+        assert recovered.status_code == 200, recovered.text
+        assert len(recovered.json()["events"]) == 1
 
 
 def test_hybrid_confirmation_round_trip():
@@ -376,8 +591,7 @@ def test_real_detector_finds_a_fall_in_uploaded_frames():
             / "Subject 1" / "Fall" / "01.mp4")
     if not clip.exists():
         pytest.skip(f"{clip} not present")
-    app = create_app(Settings(db_path=":memory:", control_plane_mode="local_dev",
-                              inference_max_fps=60))
+    app = support.app(support.settings(inference_max_fps=60))
     with TestClient(app) as client:
         secret = _setup(client)
         cap = cv2.VideoCapture(str(clip))

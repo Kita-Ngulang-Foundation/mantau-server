@@ -6,8 +6,10 @@ credentials: the agent, not this server, ever talks to the physical camera.
 from __future__ import annotations
 
 import re
+import uuid
+from mantau_core.contracts import CommandType
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
 
 from ...control_auth import authenticated_user
@@ -48,6 +50,8 @@ async def create_camera(
     repo: CamerasRepo = Depends(get_cameras_repo),
     principal: UserPrincipal = Depends(authenticated_user),
 ) -> CameraOut:
+    if principal.role not in ("owner", "admin"):
+        raise HTTPException(403, "forbidden")
     try:
         info = await repo.create(
             body.camera_id, body.name,
@@ -82,8 +86,28 @@ async def get_camera(
 @router.delete("/{camera_id}", status_code=204)
 async def delete_camera(
     camera_id: str,
+    request: Request,
     repo: CamerasRepo = Depends(get_cameras_repo),
     principal: UserPrincipal = Depends(authenticated_user),
 ) -> None:
-    if not await repo.delete(principal.household_id, camera_id):
-        raise HTTPException(404, "resource_not_found")
+    if principal.role not in ('owner', 'admin'):
+        raise HTTPException(403, 'forbidden')
+    async with request.app.state.db.transaction():
+        camera = await repo.get_for_household(principal.household_id, camera_id)
+        if camera is None:
+            raise HTTPException(404, 'resource_not_found')
+        await repo.delete(principal.household_id, camera_id)
+        await request.app.state.db.conn.execute(
+            "UPDATE queued_commands SET state='expired', encrypted_payload=NULL "
+            "WHERE agent_id=? AND state IN ('queued','delivered','running') "
+            "AND command_type IN ('configure_camera','camera_test','apply_detection_settings')",
+            (camera.agent_id,))
+        if camera.agent_id:
+            await request.app.state.db.conn.execute(
+                "UPDATE agents SET last_frame_at=NULL,last_inference_at=NULL WHERE agent_id=?", (camera.agent_id,))
+            await request.app.state.control_repo.queue(
+                agent_id=camera.agent_id, household_id=principal.household_id,
+                requested_by_user_id=principal.user_id, command_type=CommandType.REMOVE_CAMERA,
+                payload={'camera_id': camera_id}, idempotency_key='remove-camera-'+camera_id,
+                ttl_s=315360000)
+    request.app.state.frames.forget(camera_id)

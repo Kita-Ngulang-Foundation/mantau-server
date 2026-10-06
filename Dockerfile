@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM python:3.12-slim
+FROM python:3.12-slim@sha256:02108f5d322dd89f1c9e552442c25acb0543dfdbc455693a5599624f20d9155d
 
 # Server inference runs MediaPipe and needs these GL/EGL libraries.
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -12,12 +12,13 @@ COPY . /app
 # The private detector wheel is added only to a clean local deployment archive.
 # A required build fails if that wheel is missing, so a source-only deploy cannot
 # silently remove server inference. The wheel is never committed to this repo.
-ARG MANTAU_REQUIRE_DETECTOR=0
+ARG MANTAU_REQUIRE_DETECTOR=1
 RUN set -eu; \
     ref="$(tr -d '[:space:]' < mantau-core.ref)"; \
     pip install --no-cache-dir "mantau-core[push] @ https://github.com/Kita-Ngulang-Foundation/mantau-core/archive/${ref}.tar.gz"; \
     wheel=private-deps/mantau_prototype-0.1.0-py3-none-any.whl; \
     if [ -f "$wheel" ]; then \
+      sha256sum -c private-deps/SHA256SUMS; \
       pip install --no-cache-dir "$wheel"; \
     elif [ "$MANTAU_REQUIRE_DETECTOR" = 1 ]; then \
       echo 'Required private detector wheel is missing' >&2; \
