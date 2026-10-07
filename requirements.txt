@@ -1,4 +1,4 @@
 # Standalone development install; private AI checkout requires authorized Git access.
 # Production uses the hashed private wheel and mantau-core.ref in Dockerfile.
-mantau-core[push,detection] @ git+https://github.com/Kita-Ngulang-Foundation/mantau-core.git@53e63eb60e2bd547f0e625dab9a4647bc7c19a96
+mantau-core[push,detection] @ git+https://github.com/Kita-Ngulang-Foundation/mantau-core.git@9b84cd246530a668912d32984a1ec20cbc51b34a
 -e .[dev]

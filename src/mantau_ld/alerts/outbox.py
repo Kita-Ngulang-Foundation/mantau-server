@@ -5,6 +5,7 @@ import asyncio
 import logging
 import time
 
+from mantau_core.contracts import EventKind, Severity
 from mantau_core.notify import PushBinding
 from mantau_core.notify.alert import Alert
 from mantau_core.notify.templates import render
@@ -14,6 +15,13 @@ from mantau_core.telemetry import Stage
 
 log = logging.getLogger(__name__)
 MAX_ATTEMPTS = 8
+
+
+def silent_marker(event) -> bool:
+    """A night summary without bed exits: the coverage marker that lets the app
+    tell a calm night from an unmonitored one. Stored, never pushed."""
+    return (event.kind is EventKind.NOCTURNAL_MOVEMENT and event.severity is Severity.INFO
+            and event.signals.get("summary") == 1.0 and event.signals.get("bed_exits") == 0.0)
 
 
 class PushOutbox:
@@ -55,6 +63,8 @@ class PushOutbox:
             inserted = await self.events.insert(event, household_id=household_id, agent_id=agent_id)
             if not inserted:
                 return False
+            if silent_marker(event):
+                return True  # history only: the app's night calendar reads it
             name = await self.cameras.name_for(event.camera_id, household_id)
             title, body = render(event, camera_name=name)
             alert = Alert.from_event(event, camera_name=name, title=title, body=body)
