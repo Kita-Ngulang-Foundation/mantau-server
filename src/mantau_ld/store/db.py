@@ -22,6 +22,13 @@ from pathlib import Path
 import aiosqlite
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS agent_recordings (
+    event_id TEXT PRIMARY KEY REFERENCES events(event_id) ON DELETE CASCADE,
+    agent_id TEXT NOT NULL REFERENCES agents(agent_id) ON DELETE CASCADE,
+    household_id TEXT NOT NULL REFERENCES households(household_id) ON DELETE CASCADE,
+    size_bytes INTEGER NOT NULL,
+    captured_at_ms INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS inference_answers (
     agent_id TEXT NOT NULL REFERENCES agents(agent_id) ON DELETE CASCADE,
     frame_id TEXT NOT NULL, camera_id TEXT NOT NULL, household_id TEXT NOT NULL,
@@ -311,6 +318,7 @@ async def _migrate_existing(conn: aiosqlite.Connection) -> None:
     await _add_column(conn, "agents", "name TEXT")
     await _add_column(conn, "agents", "last_frame_at REAL")
     await _add_column(conn, "agents", "last_inference_at REAL")
+    await _add_column(conn, "agents", "local_recordings_supported INTEGER NOT NULL DEFAULT 0")
     await _add_column(conn, "cameras", "revoked_at REAL")
     # v3: display-only profile claims for member lists.
     await _add_column(conn, "events", "zone_id TEXT")

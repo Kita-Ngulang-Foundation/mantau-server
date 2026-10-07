@@ -5,10 +5,11 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from mantau_core.contracts import (
+    AgentRecordingsSnapshot,
     CameraRequestMetadata, CommandReceipt,
     CommandResult, CommandState, CommandType, ControlCommand, InferenceMode,
 )
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from ...control_auth import authenticated_agent, authenticated_user
 from ...control_crypto import CredentialCipher
@@ -207,12 +208,19 @@ async def poll_commands(body: AgentPollRequest, request: Request, response: Resp
                         agent=Depends(authenticated_agent),
                         repo: ControlRepo = Depends(get_control_repo)):
     if body.status:
+        try:
+            snapshot = (AgentRecordingsSnapshot(recordings=body.status.get("local_recordings", []))
+                        if "local_recordings" in body.status else None)
+        except ValidationError as exc:
+            raise HTTPException(422, "invalid_recording_snapshot") from exc
         # The validated status model has no credential-bearing fields; reject
         # obvious mistakes before persistence as a second redaction boundary.
         lowered = json.dumps(body.status).lower()
         if any(token in lowered for token in ("password", "agent_secret", "private_key", "rtsp://")):
             raise HTTPException(400, "secret_in_status")
         await repo.update_agent_report(agent.agent_id, body.status)
+        await request.app.state.agent_recordings_repo.snapshot(
+            agent.agent_id, agent.household_id, snapshot)
     await request.app.state.agents_repo.touch(agent.agent_id)
     cipher = None
     if request.app.state.settings.control_plane_encryption_key:

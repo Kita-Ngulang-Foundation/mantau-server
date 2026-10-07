@@ -30,17 +30,20 @@ class DetectionSettingsOut(BaseModel):
     applied_version: int | None
     customized: bool
     command_id: str | None = None
+    recordings_supported: bool = False
 
 
 @router.get("/cameras/{camera_id}/detection-settings", response_model=DetectionSettingsOut)
 async def get_settings(camera_id: str, request: Request,
                        cameras: CamerasRepo = Depends(get_cameras_repo),
                        principal: UserPrincipal = Depends(authenticated_user)):
-    if await cameras.get_for_household(principal.household_id, camera_id) is None:
+    camera = await cameras.get_for_household(principal.household_id, camera_id)
+    if camera is None:
         raise HTTPException(404, "resource_not_found")
     stored = await request.app.state.detection_settings_repo.get(principal.household_id, camera_id)
     return DetectionSettingsOut(camera_id=camera_id, settings=stored.settings,
-                                applied_version=stored.applied_version, customized=stored.stored)
+                                applied_version=stored.applied_version, customized=stored.stored,
+                                recordings_supported=await request.app.state.agent_recordings_repo.supported(camera.agent_id))
 
 
 @router.put("/cameras/{camera_id}/detection-settings", response_model=DetectionSettingsOut)
@@ -54,16 +57,23 @@ async def put_settings(camera_id: str, body: DetectionSettings, request: Request
     if principal.role not in ("owner", "admin"):
         raise HTTPException(403, "forbidden")
     repo = request.app.state.detection_settings_repo
+    supports_recordings = await request.app.state.agent_recordings_repo.supported(camera.agent_id)
+    previous = await repo.get(principal.household_id, camera_id)
+    if body.recordings != previous.settings.recordings and not supports_recordings:
+        raise HTTPException(409, "agent_recordings_upgrade_required")
     try:
         async with request.app.state.db.transaction():
             stored = await repo.save(principal.household_id, camera_id, body, principal.user_id)
             command_id = None
             if camera.agent_id:
+                delivered = stored.model_dump(mode="json")
+                if not supports_recordings:
+                    delivered.pop("recordings", None)
                 command = await control.queue(
                     agent_id=camera.agent_id, household_id=principal.household_id,
                     requested_by_user_id=principal.user_id,
                     command_type=CommandType.APPLY_DETECTION_SETTINGS,
-                    payload={"camera_id": camera_id, "settings": stored.model_dump(mode="json")},
+                    payload={"camera_id": camera_id, "settings": delivered},
                     idempotency_key=f"detection-settings-{camera_id}-{stored.version}-{uuid.uuid4().hex}",
                     ttl_s=request.app.state.settings.command_ttl_s,
                 )
@@ -73,4 +83,4 @@ async def put_settings(camera_id: str, body: DetectionSettings, request: Request
     current = await repo.get(principal.household_id, camera_id)
     return DetectionSettingsOut(camera_id=camera_id, settings=stored,
                                 applied_version=current.applied_version, customized=True,
-                                command_id=command_id)
+                                command_id=command_id, recordings_supported=supports_recordings)

@@ -31,6 +31,8 @@ from ..store.control_repo import ControlRepo
 from ..store.db import Database
 from ..store.detection_settings_repo import DetectionSettingsRepo
 from ..store.recordings_repo import RecordingsRepo
+from ..store.agent_recordings_repo import AgentRecordingsRepo
+from ..recording_relay import RecordingRelay
 from ..store.events_repo import EventsRepo
 from ..store.identity_repo import IdentityRepo
 from ..store.inference_repo import InferenceRepo
@@ -116,6 +118,8 @@ def create_app(
         app.state.dispatcher = dispatcher
         app.state.ack_service = AckService()
         app.state.frames = FrameStore()
+        app.state.agent_recordings_repo = AgentRecordingsRepo(db)
+        app.state.recording_relay = RecordingRelay(max_bytes=settings.recording_max_bytes)
         app.state.detection_settings_repo = DetectionSettingsRepo(db)
         app.state.recordings_repo = RecordingsRepo(db, settings.recordings_dir,
             household_max_bytes=settings.recording_household_max_bytes,
