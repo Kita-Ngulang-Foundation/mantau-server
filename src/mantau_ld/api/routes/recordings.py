@@ -11,13 +11,15 @@ from __future__ import annotations
 import hashlib
 import hmac
 import asyncio
+from typing import Annotated
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from fastapi.responses import FileResponse
 from mantau_core.contracts import EventKind, CommandType
 from ...recording_relay import RelayBusy, RelayResponse
 
-from ...control_auth import authenticated_user
+from ...control_auth import authenticated_user, authenticated_agent
 from ...store.agents_repo import AgentsRepo
 from ...store.events_repo import EventsRepo
 from ...store.recordings_repo import RecordingsCapacityExceeded
@@ -28,6 +30,46 @@ from ..limits import read_limited
 router = APIRouter(tags=["recordings"])
 
 _ALLOWED_TYPES = {"video/mp4"}
+
+
+class LegacyClipCheck(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    event_ids: list[Annotated[str, Field(min_length=1, max_length=200,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$")]] = Field(max_length=5)
+
+    @field_validator("event_ids")
+    @classmethod
+    def unique_ids(cls, values):
+        if len(set(values)) != len(values):
+            raise ValueError("duplicate event identifiers")
+        return values
+
+
+@router.post("/agent-control/recordings/legacy-check")
+async def legacy_clip_check(body: LegacyClipCheck, request: Request,
+                            agent=Depends(authenticated_agent)):
+    """Metadata only. Never infer a legacy file's ownership from its filename."""
+    if agent.household_id is None:
+        raise HTTPException(401, "unauthorized")
+    approved = []
+    events = request.app.state.events_repo
+    async with request.app.state.db.transaction():
+        for event_id in body.event_ids:
+            record = await events.record(agent.household_id, event_id)
+            if (record is None or not record.recording_permitted
+                    or record.event.kind is EventKind.BATHROOM_DURATION
+                    or await events.agent_for(event_id) != agent.agent_id):
+                continue
+            camera = await request.app.state.cameras_repo.get_for_household(
+                agent.household_id, record.event.camera_id)
+            if camera is None or camera.agent_id != agent.agent_id:
+                continue
+            approved.append({
+                "event_id": event_id, "camera_id": record.event.camera_id,
+                "kind": record.event.kind.value,
+                "occurred_at_ms": int(record.event.occurred_at.timestamp() * 1000),
+            })
+    return {"recordings": approved}
 
 
 @router.post("/events/{event_id}/recording", status_code=204)
