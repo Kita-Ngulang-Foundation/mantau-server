@@ -1,9 +1,13 @@
-"""Event clips.
+"""Event clips, relayed once from the agent that keeps them.
 
-Upload: the agent that produced the event, signed like live frames with
-HMAC-SHA256(secret, "<event_id>." + body). Bathroom-duration events are never
-recorded -- that zone is private by design -- and uploads for them are
-refused. Download: any member of the event's household.
+Clips stay on the agent (and on the family's phone). The server never stores
+them: a household member's download queues an UPLOAD_RECORDING command, the
+agent uploads the clip with that one-use transfer id, signed like live frames
+with HMAC-SHA256(secret, "<event_id>." + body), and the bytes are passed
+through memory to the waiting download. An upload without a transfer id
+(agents older than local clip retention) is refused with 409
+`recording_transfer_required`. Bathroom-duration events are never recorded --
+that zone is private by design.
 """
 
 from __future__ import annotations
@@ -15,14 +19,12 @@ from typing import Annotated
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
-from fastapi.responses import FileResponse
 from mantau_core.contracts import EventKind, CommandType
 from ...recording_relay import RelayBusy, RelayResponse
 
 from ...control_auth import authenticated_user, authenticated_agent
 from ...store.agents_repo import AgentsRepo
 from ...store.events_repo import EventsRepo
-from ...store.recordings_repo import RecordingsCapacityExceeded
 from ...store.identity_repo import UserPrincipal
 from ..deps import get_agents_repo, get_events_repo
 from ..limits import read_limited
@@ -102,7 +104,6 @@ async def upload_recording(
         raise HTTPException(404, "resource_not_found")
     if record.event.kind is EventKind.BATHROOM_DURATION:
         raise HTTPException(403, "recording_not_allowed")
-    policy = await request.app.state.detection_settings_repo.get(agent.household_id, record.event.camera_id)
     if transfer_id is not None:
         if not record.recording_permitted:
             raise HTTPException(404, "resource_not_found")
@@ -110,21 +111,8 @@ async def upload_recording(
                 transfer_id, agent.household_id, agent.agent_id, event_id, body):
             raise HTTPException(410, "recording_transfer_expired")
         return Response(status_code=204)
-    if await request.app.state.agent_recordings_repo.supported(agent.agent_id):
-        raise HTTPException(409, "recording_transfer_required")
-    if not policy.settings.recordings.enabled:
-        raise HTTPException(403, "recording_disabled")
-    # Legacy clients remain readable during rollout; updated agents use the one-use relay above.
-    repo = request.app.state.recordings_repo
-    try:
-        await repo.save(household_id=agent.household_id, event_id=event_id,
-                        camera_id=record.event.camera_id, body=body, content_type=content_type)
-    except RecordingsCapacityExceeded as exc:
-        raise HTTPException(507, 'recording_capacity') from exc
-    except (ValueError, OSError) as exc:
-        raise HTTPException(503, 'recording_storage_unavailable') from exc
-    await repo.prune(settings.recording_retention_days)
-    return Response(status_code=204)
+    # No server-side storage: every clip goes through the one-use relay above.
+    raise HTTPException(409, "recording_transfer_required")
 
 
 @router.get("/events/{event_id}/recording")
@@ -133,10 +121,6 @@ async def download_recording(event_id: str, request: Request,
     event = await request.app.state.events_repo.record(principal.household_id, event_id)
     if event is None or not event.recording_permitted or event.event.kind is EventKind.BATHROOM_DURATION:
         raise HTTPException(404, "resource_not_found")
-    recording = await request.app.state.recordings_repo.get(principal.household_id, event_id)
-    if recording is not None:
-        return FileResponse(recording.path, media_type=recording.content_type,
-                            headers={"Cache-Control": "private, no-store"})
     available = await request.app.state.agent_recordings_repo.get(principal.household_id, event_id)
     if available is None:
         raise HTTPException(404, "resource_not_found")

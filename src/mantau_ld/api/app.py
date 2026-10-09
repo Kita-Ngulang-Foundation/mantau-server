@@ -124,7 +124,8 @@ def create_app(
         app.state.recordings_repo = RecordingsRepo(db, settings.recordings_dir,
             household_max_bytes=settings.recording_household_max_bytes,
             global_max_bytes=settings.recording_global_max_bytes)
-        await app.state.recordings_repo.prune(settings.recording_retention_days)
+        # The server keeps no clips; delete any an older version stored.
+        await app.state.recordings_repo.purge_all()
         app.state.inference_repo = InferenceRepo(db)
         await app.state.inference_repo.prune(settings.inference_result_retention_days)
         app.state.inference = InferenceService(
@@ -135,7 +136,6 @@ def create_app(
         async def maintain():
             while True:
                 try:
-                    await app.state.recordings_repo.prune(settings.recording_retention_days)
                     await app.state.inference_repo.prune(settings.inference_result_retention_days)
                     await events_repo.prune(settings.event_retention_days,
                                             recordings_root=settings.recordings_dir)

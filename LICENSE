@@ -1,0 +1,19 @@
+Copyright (c) 2026 Muhammad Kaila Aidam Riyan, Abdurrahman Ammar Abqary,
+Randuichi Touya. All rights reserved.
+
+This repository is part of Mantau ("Mantau: Sistem Deteksi Jatuh dan Anomali
+Lansia Berbasis CCTV Rumah"). Its source code, documentation and other material
+written by the copyright holders are proprietary. No licence is granted to use,
+copy, modify, merge, publish, distribute, sublicense or sell them, in whole or
+in part, without the prior written permission of the copyright holders.
+Viewing this repository on a hosting service does not grant such permission.
+
+Third-party components (libraries, models, datasets, standards and services)
+remain under their own licences and terms. The copyright holders claim no
+rights in them. See the third-party notices shipped with each build.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE COPYRIGHT
+HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY ARISING FROM, OUT OF
+OR IN CONNECTION WITH THE SOFTWARE OR ITS USE.

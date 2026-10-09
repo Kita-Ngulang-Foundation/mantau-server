@@ -67,9 +67,8 @@ the inherited ones -- push credentials, backoff defaults):
 | `MANTAU_COMMAND_DELIVERY_LEASE_S` | `30` | Re-delivery delay when an agent does not acknowledge a delivered command. |
 | `MANTAU_ENROLLMENT_KEY_TTL_S` | `3600` | Lifetime of a single-use enrollment key. Only its SHA-256 is stored. |
 | `MANTAU_CORS_ORIGINS` | empty | Comma-separated browser origins. Empty disables CORS (the mobile app and agents do not need it). |
-| `MANTAU_RECORDINGS_DIR` | `data/recordings` | Event clips. Put on the same persistent volume as the database. |
-| `MANTAU_RECORDING_RETENTION_DAYS` | `30` | Older clips are deleted. |
-| `MANTAU_RECORDING_MAX_BYTES` / `MANTAU_FRAME_MAX_BYTES` | 20 MB / 2 MB | Upload limits (413 above them). |
+| `MANTAU_RECORDINGS_DIR` | `data/recordings` | Where older server versions stored event clips. The server stores none now; on every start it deletes any clip left there and its index row. |
+| `MANTAU_RECORDING_MAX_BYTES` / `MANTAU_FRAME_MAX_BYTES` | 20 MB / 2 MB | Relayed clip and live frame limits (413 above them). |
 | `MANTAU_HOUSEHOLD_INVITE_TTL_S` | `172800` | Invite code lifetime. |
 | `MANTAU_INFERENCE_ENABLED` | `true` | Server inference for agents without a usable on-device detector. Needs mantau-AI (`mantau-core[detection]`); otherwise reported unavailable. |
 | `MANTAU_INFERENCE_MAX_FRAME_BYTES` | `524288` | Per-frame upload limit (413 above it). |
@@ -98,8 +97,8 @@ the inherited ones -- push credentials, backoff defaults):
 | `POST /households/join` | Join a household with a single-use invite code (rate-limited). Needs no household selection. |
 | `PATCH /households/{id}`, `GET /households/{id}/members`, `POST /households/{id}/invites`, `DELETE /households/{id}/members/{user_id}` | Rename, list members, invite (owner/admin; admin invites only by owners), remove or leave. The last owner cannot leave. Push alerts go to every current member. |
 | `GET/PUT /cameras/{id}/detection-settings` | Zones, per-feature thresholds, night window, timezone. Members read; owners/admins write. Each change is a new version delivered to the agent (`apply_detection_settings`); `applied_version` shows what the agent runs. One-time startup migration (schema version 4): stored `stillness.floor_minutes` exactly 2.0 (the old default) becomes 0.5, with a new version and a queued `apply_detection_settings`; other values are kept. |
-| `POST /events/{id}/recording` | Agent-signed MP4 clip upload for its own event (`HMAC(secret, "<event_id>." + body)`). Refused for bathroom-duration events. Size-limited. |
-| `GET /events/{id}/recording` | Clip download for household members. |
+| `POST /events/{id}/recording?transfer_id=…` | Agent-signed MP4 clip for its own event (`HMAC(secret, "<event_id>." + body)`), answering a one-use `upload_recording` command. Passed through memory to the waiting download, never stored. Without a transfer id: 409 `recording_transfer_required`. Refused for bathroom-duration events. Size-limited. |
+| `GET /events/{id}/recording` | Clip download for household members: asks the agent that keeps the clip to upload it once (relay). 404 when no agent reports the clip, 503 when the agent does not answer. |
 | `POST /cameras/{id}/frame`, `GET /cameras/{id}/snapshot.jpg`, `GET /cameras/{id}/live.mjpeg` | Live view: agent-signed JPEG upload (`HMAC(secret, "<camera_id>." + body)`), latest frame in memory only. Each upload answers `X-Mantau-Live-Viewers`: open MJPEG streams plus a snapshot fetched in the last 5 s; agents send video-rate frames only while it is above 0. |
 | `GET /inference/capability` | Whether this server runs the fall detector, with its frame limits. No tenant data; agents read it at startup. |
 | `POST /agents/{id}/inference` | Agent-signed JPEG frame (`mantau_core.contracts.inference`: HMAC over a versioned message covering every header and the body). The server runs the same detector as the agents in one session per agent+camera+session id. Falls it detects are stored and pushed like ingested events and returned; frames with `X-Mantau-Event-Ids` are HYBRID confirmations, stored against that agent's own events (`server_confirmed` on `GET /events/{id}`). Retries with the same frame id return the first answer. Frames are never stored. |
@@ -168,7 +167,7 @@ exercising the full ingest -> dispatch -> event path together.
   out-of-order envelope and flags it; it does not hold it back to restore
   strict per-agent sequence. See that module's docstring for what a reorder
   buffer would need.
-- Native agents generate bounded event clips; this server admits, stores and serves them under household authorization.
+- Native agents keep bounded event clips on the device; this server only relays one clip on demand under household authorization and stores none.
 - **Agent secrets are stored in plain SQLite columns**, same simplification
   as mantau-backend-rtsp's camera passwords.
 - **Docker Compose is unverified end-to-end** (`../docker/compose.yaml`) --
