@@ -1,7 +1,15 @@
-"""Bounded event clips on a persistent volume, with checked household paths."""
+"""Clips stored by agents older than local clip retention, and their removal.
+
+The server no longer stores clips: uploads go through the one-use relay
+(routes/recordings.py). `purge_all` runs at startup and deletes whatever an
+older server version stored under `recordings_dir`. `save`, `get` and `prune`
+are kept for the existing tests, which seed such leftover rows; no route calls
+them.
+"""
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shutil
@@ -12,6 +20,8 @@ from pathlib import Path
 
 from .db import Database
 from .transactions import serialized_repository
+
+log = logging.getLogger(__name__)
 
 
 class RecordingsCapacityExceeded(ValueError):
@@ -176,3 +186,50 @@ class RecordingsRepo:
                                         (row["recording_id"],))
         await self._db.conn.commit()
         return len(rows)
+
+    async def purge_all(self) -> int:
+        """Delete every stored clip file and index row; return the rows removed.
+
+        Idempotent. A file that cannot be deleted keeps its row, so the next
+        start retries it. A corrupt index row is dropped without following its
+        path. Interrupted uploads and clips without a row are removed from the
+        household folders too; links are never followed."""
+        if self._db.in_atomic:
+            raise RuntimeError("Purge recordings outside a caller-owned transaction")
+        rows = await (await self._db.conn.execute("SELECT * FROM recordings")).fetchall()
+        removed = 0
+        for row in rows:
+            try:
+                path = self._indexed_path(row)
+            except ValueError:
+                path = None
+            if path is not None:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    log.warning("Could not delete stored clip %s; retrying on next start",
+                                row["storage_key"])
+                    continue
+            await self._db.conn.execute("DELETE FROM recordings WHERE recording_id=?",
+                                        (row["recording_id"],))
+            removed += 1
+        await self._db.conn.commit()
+        if self.root.is_dir() and not self.root.is_symlink():
+            for household in self.root.iterdir():
+                if (household.is_symlink() or not household.is_dir()
+                        or household.resolve() != household):
+                    continue
+                for item in household.iterdir():
+                    if (item.is_file() and not item.is_symlink()
+                            and (item.suffix == ".mp4" or item.name.startswith(".recording-"))):
+                        try:
+                            item.unlink(missing_ok=True)
+                        except OSError:
+                            log.warning("Could not delete stored clip file %s", item.name)
+                try:
+                    household.rmdir()
+                except OSError:
+                    pass
+        if removed:
+            log.info("Deleted %d stored clips; the server keeps no clips", removed)
+        return removed

@@ -13,7 +13,8 @@ credential migration makes queued camera credentials unreadable.
 
 ## Backup and isolated restore
 
-Stop the server before taking a database and recording filesystem snapshot.
+Stop the server before taking a database snapshot. The server stores no clips; on
+every start it deletes any clip an older version left under `/data/recordings`.
 The operator must restrict access to the backup directory: it contains personal
 data, agent credentials and encrypted camera commands. Store existing Firebase
 and control-plane keys in the operator secret store separately. Keep backup
@@ -29,25 +30,25 @@ python ops/backup_restore.py --service-stopped restore \
 ```
 
 These commands refuse existing destinations, check SQLite integrity and
-foreign keys, exclude interrupted clip parts, and verify every file hash.
+foreign keys, exclude interrupted clip parts, and verify every file hash. A
+restored snapshot from before clip removal loses its clips on first start.
 First start the restored image against the isolated directory with matching
 keys and outbound delivery disabled. Verify household/settings/enrollment,
-authenticated clip access and outbox idempotency before a deliberate cutover.
+relayed clip access and outbox idempotency before a deliberate cutover.
 An image rollback alone cannot undo changed database state.
 
 ## Resource and delivery diagnostics
 
-Hourly maintenance prunes expired events, inference dedupe results and recordings.
-Defaults: 30-day event/clip retention, 20 MiB per upload, 1 GiB per household,
-5 GiB globally. Clip admission rejects new data at quota with HTTP 507 and
-preserves existing history. Staged replacements require additional free disk
-space. These are configured bounds; measured sustainable camera capacity is
+Hourly maintenance prunes expired events and inference dedupe results.
+Defaults: 30-day event retention, 20 MiB per relayed clip. Clips stay on the
+agents; the server passes one clip through memory per download and stores
+none. These are configured bounds; measured sustainable camera capacity is
 still a release gate. Eight detector sessions/two workers is an admission
 setting, not a throughput guarantee.
 
 `GET /households/{id}/diagnostics` requires household membership and reports
 retention, quota use, inference availability and delivery states. Pending/failed
-delivery, HTTP 507, detector unavailable, stale inference and maintenance errors
+delivery, detector unavailable, stale inference and maintenance errors
 need operator attention. Log/monitor these states and disk pressure outside the
 single server; caregiver notification delivery cannot serve as its own outage
 alarm. A provider delivery acknowledgement is not a caregiver read receipt.

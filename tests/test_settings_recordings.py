@@ -101,12 +101,12 @@ def test_only_the_producing_agent_uploads_and_members_download(tmp_path):
             **_signed(secret, event.event_id, MP4), "Content-Type": "text/html",
         }).status_code == 415
         assert client.post(path, content=MP4,
-                           headers=_signed(secret, event.event_id, MP4)).status_code == 204
+                           headers=_signed(secret, event.event_id, MP4)).status_code == 409
 
-        assert client.get(path, headers=OWNER).content == MP4
+        assert client.get(path, headers=OWNER).status_code == 404
         assert client.get(path, headers=STRANGER).status_code == 404
         listed = client.get("/events", headers=OWNER).json()
-        assert listed[0]["has_recording"] is True
+        assert listed[0]["has_recording"] is False
 
 
 def test_bathroom_events_are_never_recorded_and_uploads_are_bounded(tmp_path):
