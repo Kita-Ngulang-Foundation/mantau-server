@@ -221,6 +221,8 @@ async def poll_commands(body: AgentPollRequest, request: Request, response: Resp
         await repo.update_agent_report(agent.agent_id, body.status)
         await request.app.state.agent_recordings_repo.snapshot(
             agent.agent_id, agent.household_id, snapshot)
+        await request.app.state.agents_repo.set_stream_settings_supported(
+            agent.agent_id, body.status.get("stream_settings") is True)
     await request.app.state.agents_repo.touch(agent.agent_id)
     cipher = None
     if request.app.state.settings.control_plane_encryption_key:

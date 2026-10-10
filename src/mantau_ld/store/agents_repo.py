@@ -189,6 +189,23 @@ class AgentsRepo:
         )).fetchall()
         return [self._row(row) for row in rows]
 
+    async def set_stream_settings_supported(self, agent_id: str, supported: bool) -> None:
+        """Agents that apply the `stream` settings section say so in every status report."""
+        await self._db.conn.execute(
+            "UPDATE agents SET stream_settings_supported=? WHERE agent_id=? "
+            "AND stream_settings_supported!=?",
+            (int(supported), agent_id, int(supported)),
+        )
+        await self._db.conn.commit()
+
+    async def stream_settings_supported(self, agent_id: str | None) -> bool:
+        if not agent_id:
+            return False
+        row = await (await self._db.conn.execute(
+            "SELECT stream_settings_supported FROM agents WHERE agent_id=? AND revoked_at IS NULL",
+            (agent_id,))).fetchone()
+        return bool(row and row[0])
+
     async def touch(self, agent_id: str, *, at: float | None = None) -> None:
         await self._db.conn.execute(
             "UPDATE agents SET last_seen_at=? WHERE agent_id=? AND revoked_at IS NULL",

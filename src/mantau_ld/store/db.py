@@ -319,6 +319,7 @@ async def _migrate_existing(conn: aiosqlite.Connection) -> None:
     await _add_column(conn, "agents", "last_frame_at REAL")
     await _add_column(conn, "agents", "last_inference_at REAL")
     await _add_column(conn, "agents", "local_recordings_supported INTEGER NOT NULL DEFAULT 0")
+    await _add_column(conn, "agents", "stream_settings_supported INTEGER NOT NULL DEFAULT 0")
     await _add_column(conn, "cameras", "revoked_at REAL")
     # v3: display-only profile claims for member lists.
     await _add_column(conn, "events", "zone_id TEXT")

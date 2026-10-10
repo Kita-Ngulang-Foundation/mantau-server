@@ -31,6 +31,8 @@ class DetectionSettingsOut(BaseModel):
     customized: bool
     command_id: str | None = None
     recordings_supported: bool = False
+    # The camera's agent applies the `stream` section; older agents ignore it.
+    stream_supported: bool = False
 
 
 @router.get("/cameras/{camera_id}/detection-settings", response_model=DetectionSettingsOut)
@@ -43,7 +45,8 @@ async def get_settings(camera_id: str, request: Request,
     stored = await request.app.state.detection_settings_repo.get(principal.household_id, camera_id)
     return DetectionSettingsOut(camera_id=camera_id, settings=stored.settings,
                                 applied_version=stored.applied_version, customized=stored.stored,
-                                recordings_supported=await request.app.state.agent_recordings_repo.supported(camera.agent_id))
+                                recordings_supported=await request.app.state.agent_recordings_repo.supported(camera.agent_id),
+                                stream_supported=await request.app.state.agents_repo.stream_settings_supported(camera.agent_id))
 
 
 @router.put("/cameras/{camera_id}/detection-settings", response_model=DetectionSettingsOut)
@@ -58,9 +61,15 @@ async def put_settings(camera_id: str, body: DetectionSettings, request: Request
         raise HTTPException(403, "forbidden")
     repo = request.app.state.detection_settings_repo
     supports_recordings = await request.app.state.agent_recordings_repo.supported(camera.agent_id)
+    supports_stream = await request.app.state.agents_repo.stream_settings_supported(camera.agent_id)
     previous = await repo.get(principal.household_id, camera_id)
     if body.recordings != previous.settings.recordings and not supports_recordings:
         raise HTTPException(409, "agent_recordings_upgrade_required")
+    if "stream" not in body.model_fields_set:
+        # An app that predates stream settings must not reset them to defaults.
+        body = body.model_copy(update={"stream": previous.settings.stream})
+    elif body.stream != previous.settings.stream and not supports_stream:
+        raise HTTPException(409, "agent_stream_upgrade_required")
     try:
         async with request.app.state.db.transaction():
             stored = await repo.save(principal.household_id, camera_id, body, principal.user_id)
@@ -69,6 +78,8 @@ async def put_settings(camera_id: str, body: DetectionSettings, request: Request
                 delivered = stored.model_dump(mode="json")
                 if not supports_recordings:
                     delivered.pop("recordings", None)
+                if not supports_stream:
+                    delivered.pop("stream", None)
                 command = await control.queue(
                     agent_id=camera.agent_id, household_id=principal.household_id,
                     requested_by_user_id=principal.user_id,
@@ -83,4 +94,5 @@ async def put_settings(camera_id: str, body: DetectionSettings, request: Request
     current = await repo.get(principal.household_id, camera_id)
     return DetectionSettingsOut(camera_id=camera_id, settings=stored,
                                 applied_version=current.applied_version, customized=True,
-                                command_id=command_id, recordings_supported=supports_recordings)
+                                command_id=command_id, recordings_supported=supports_recordings,
+                                stream_supported=supports_stream)

@@ -9,6 +9,12 @@ agent ingests (stored under that agent, pushed to the household) and are
 returned so the agent can attach a clip. HYBRID confirmation results are
 stored against the agent's own events and returned. The frame itself is
 never stored: it is decoded in memory and dropped.
+
+An agent that sends `X-Mantau-Live: 1` also lets the frame stand in for its
+live-view upload: it becomes the camera's latest in-memory live frame (the
+same store `/cameras/{id}/frame` fills), and the response carries
+`X-Mantau-Live-Frame: 1` plus `X-Mantau-Live-Viewers`. Agents send their
+separate live upload whenever that header stops arriving.
 """
 
 from __future__ import annotations
@@ -16,11 +22,12 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import hashlib
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from mantau_core.contracts import InferenceCapability, InferenceResult
 from mantau_core.contracts import inference as contract
 
 from ...alerts.dispatcher import AlertDispatcher
+from ...frames import FrameStore
 from ...inference.service import (
     CapacityExceeded, InferenceService, InferenceUnavailable, RateLimited, UndecodableFrame,
 )
@@ -28,7 +35,7 @@ from ...store.agents_repo import AgentsRepo
 from ...store.cameras_repo import CamerasRepo
 from ...store.events_repo import EventsRepo
 from ...store.inference_repo import InferenceRepo
-from ..deps import get_agents_repo, get_cameras_repo, get_dispatcher, get_events_repo
+from ..deps import get_agents_repo, get_cameras_repo, get_dispatcher, get_events_repo, get_frames
 from ..limits import read_limited
 
 router = APIRouter(tags=["inference"])
@@ -68,6 +75,7 @@ def _int(value: str, name: str) -> int:
 async def infer(
     agent_id: str,
     request: Request,
+    response: Response,
     x_mantau_agent: str = Header(...),
     x_mantau_camera: str = Header(...),
     x_mantau_session: str = Header(...),
@@ -76,12 +84,14 @@ async def infer(
     x_mantau_captured_at: str = Header(...),
     x_mantau_signature: str = Header(...),
     x_mantau_event_ids: str = Header(""),
+    x_mantau_live: str = Header(""),
     agents: AgentsRepo = Depends(get_agents_repo),
     cameras: CamerasRepo = Depends(get_cameras_repo),
     events: EventsRepo = Depends(get_events_repo),
     dispatcher: AlertDispatcher = Depends(get_dispatcher),
     service: InferenceService = Depends(get_inference),
     results: InferenceRepo = Depends(get_inference_repo),
+    frames: FrameStore = Depends(get_frames),
 ) -> InferenceResult:
     settings = request.app.state.settings
     content_type = request.headers.get("content-type", "").split(";")[0].strip()
@@ -145,6 +155,11 @@ async def infer(
     captured_at = datetime.fromtimestamp(captured_at_ms / 1000, timezone.utc)
 
     household_id = agent.household_id
+    if x_mantau_live == "1":
+        frames.put(camera_id, body, household_id=household_id, agent_id=agent_id,
+                   captured_at_ms=captured_at_ms)
+        response.headers["X-Mantau-Live-Frame"] = "1"
+        response.headers["X-Mantau-Live-Viewers"] = str(frames.viewers(camera_id))
     camera_settings = (await request.app.state.detection_settings_repo.get(
         household_id, camera_id)).settings
 
