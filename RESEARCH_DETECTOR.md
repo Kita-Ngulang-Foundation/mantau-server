@@ -12,6 +12,8 @@ preserving `version`. Defaults:
 Set `fall.model` to `s1b` for rollback. The next uploaded frame applies the new
 configuration; any pending candidate is logged as interrupted. Activity rules
 retain their existing thresholds and logic, including the 30 s floor backup.
+The older `fall.min_confidence` field filters S1b events; research uses its
+explicit `tau_loose` and `tau_high` thresholds instead.
 
 Research candidates are stored in `events` under the camera's household and
 agent, with one event id from candidacy through resolution. `signals` records

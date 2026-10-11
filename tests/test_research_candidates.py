@@ -174,3 +174,14 @@ def test_terminal_candidate_cannot_be_downgraded_by_a_late_pending_snapshot():
         history = client.get("/events", headers=USER_A).json()[0]
         assert history["severity"] == "critical" and history["signals"]["candidate_outcome"] == 1
         assert len(notifier.sent) == 1
+
+
+def test_legacy_min_confidence_does_not_override_the_new_camera_thresholds():
+    from mantau_core.contracts import DetectionSettings
+    from mantau_ld.inference.service import _allowed_event
+    policy = DetectionSettings.model_validate({"fall": {"min_confidence": 1}})
+    candidate = FallEvent(camera_id="cam-a", confidence=0.95,
+                         signals={"research_candidate": 1, "candidate_outcome": 1})
+    assert _allowed_event(candidate, policy, None)
+    assert candidate.signals.get("alert_suppressed") is None
+    assert not _allowed_event(FallEvent(camera_id="cam-a", confidence=0.95), policy, None)

@@ -393,7 +393,9 @@ def _allowed_event(event: FallEvent, settings: DetectionSettings, observation) -
     if event.kind is not EventKind.FALL:
         return True
     candidate = event.signals.get("research_candidate") == 1
-    if candidate and (not settings.fall.enabled or event.confidence < settings.fall.min_confidence):
+    # Research has its own loose/high thresholds; the legacy confidence
+    # slider must not silently suppress a valid Tier B confirmation.
+    if candidate and not settings.fall.enabled:
         event.signals["alert_suppressed"] = 1.0
     if not candidate and (not settings.fall.enabled or event.confidence < settings.fall.min_confidence):
         return False
