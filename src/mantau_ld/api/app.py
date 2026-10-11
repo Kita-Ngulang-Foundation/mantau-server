@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import asyncio
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
@@ -128,11 +129,51 @@ def create_app(
         await app.state.recordings_repo.purge_all()
         app.state.inference_repo = InferenceRepo(db)
         await app.state.inference_repo.prune(settings.inference_result_retention_days)
+        async def timer_events(agent_id, camera_id, events):
+            async with db.transaction():
+                camera = await cameras_repo.get_for_agent(agent_id, camera_id)
+                if camera is None:
+                    return
+                agent = await agents_repo.get(camera.agent_id)
+                if agent is None or agent.revoked_at is not None or agent.household_id != camera.household_id:
+                    return
+                policy = (await app.state.detection_settings_repo.get(camera.household_id, camera_id)).settings
+                for event in events:
+                    from ..inference.service import _allowed_event
+                    if _allowed_event(event, policy, None):
+                        await dispatcher.dispatch(event, household_id=camera.household_id,
+                                                  agent_id=camera.agent_id, deliver=False)
         app.state.inference = InferenceService(
-            settings, factory=inference_factory, decoder=inference_decoder)
+            settings, factory=inference_factory, decoder=inference_decoder, timer_events=timer_events)
         await app.state.inference.start()
 
         await dispatcher.outbox.start()
+        # A process restart loses poses and tracks, but must not lose a
+        # candidate already logged as down. Restore its original deadline.
+        startup_candidates = await events_repo.pending_candidates()
+        async def recover_candidates():
+            from mantau_core.contracts import Severity
+            from ..inference.service import _server_event
+            while startup_candidates:
+                for entry in list(startup_candidates):
+                    household_id, agent_id, event = entry
+                    due = event.occurred_at.timestamp() + event.signals.get("confirm_s", 15)
+                    if datetime.now(timezone.utc).timestamp() < due:
+                        continue
+                    confirmed = event.signals.get("last_down") == 1
+                    restored = event.model_copy(update={
+                        "severity": Severity.CRITICAL if confirmed else Severity.INFO,
+                        "signals": {**event.signals, "candidate_outcome": 1.0 if confirmed else 3.0,
+                                    "track_lost_down": float(confirmed), "recovered_after_restart": 1.0,
+                                    "confirmation_elapsed_s": datetime.now(timezone.utc).timestamp() - event.occurred_at.timestamp()}})
+                    try:
+                        await timer_events(agent_id, event.camera_id, [_server_event(restored)])
+                    except Exception as exc:
+                        log.error("candidate restart recovery failed (%s)", type(exc).__name__)
+                        continue
+                    startup_candidates.remove(entry)
+                await asyncio.sleep(0.1)
+        recovery = asyncio.create_task(recover_candidates(), name="fall-candidate-recovery")
         async def maintain():
             while True:
                 try:
@@ -147,9 +188,11 @@ def create_app(
             yield
         finally:
             maintenance.cancel()
+            recovery.cancel()
             await asyncio.gather(maintenance, return_exceptions=True)
-            await dispatcher.outbox.close()
+            await asyncio.gather(recovery, return_exceptions=True)
             await app.state.inference.close()
+            await dispatcher.outbox.close()
             await db.close()
             sync_db.close()
 

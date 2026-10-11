@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 import numpy as np
-from mantau_core.activity import ActivityEngine, Posture, default_rules
+from mantau_core.activity import ActivityEngine, Posture, Perception, default_rules
 from mantau_core.activity.geometry import zone_at
 from mantau_core.contracts import DetectionSettings, EventKind, ZoneKind
 from mantau_core.contracts import (
@@ -80,6 +80,8 @@ class _Session:
     last_confirm_ts: int | None = None
     last_seen: float = field(default_factory=time.monotonic)
     last_arrival: float = 0.0
+    stream_config: dict | None = None
+    last_frame_monotonic: float = 0.0
     failed: bool = False
     captured_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     # Prolonged position / nocturnal movement / bathroom duration on this stream,
@@ -89,7 +91,7 @@ class _Session:
 
 class InferenceService:
     def __init__(self, settings: Settings, *, factory: DetectorFactory | None = None,
-                 decoder: FrameDecoder | None = None) -> None:
+                 decoder: FrameDecoder | None = None, timer_events=None) -> None:
         self.settings = settings
         self._factory = factory or default_detector_factory
         self._decode = decoder or default_decoder
@@ -101,6 +103,9 @@ class InferenceService:
         self._computed: dict[tuple[str, str], tuple[str, InferenceResult | None]] = {}
         self.available = False
         self.reason: str | None = "Server inference has not started"
+        self._timer_events = timer_events
+        self._timer_task = None
+        self._timer_pending = []
 
     # -- lifecycle -------------------------------------------------------------
     async def start(self) -> None:
@@ -109,7 +114,7 @@ class InferenceService:
             return
         try:
             probe = await asyncio.to_thread(
-                self._factory, "probe", {}, lambda: datetime.now(timezone.utc))
+                self._factory, "probe", _detector_config(DetectionSettings()), lambda: datetime.now(timezone.utc))
             await asyncio.to_thread(probe.close)
         except Exception as exc:  # noqa: BLE001 -- report the type only, never paths/secrets
             self.available = False
@@ -117,8 +122,14 @@ class InferenceService:
             log.warning("server inference unavailable: %s", type(exc).__name__)
             return
         self.available, self.reason = True, None
+        if self._timer_events is not None:
+            self._timer_task = asyncio.create_task(self._timers(), name="fall-confirmation-timers")
 
     async def close(self) -> None:
+        if self._timer_task is not None:
+            self._timer_task.cancel()
+            await asyncio.gather(self._timer_task, return_exceptions=True)
+            self._timer_task = None
         await asyncio.gather(*list(self._in_flight.values()), return_exceptions=True)
         async with self._sessions_lock:
             sessions, self._sessions = list(self._sessions.values()), {}
@@ -227,8 +238,9 @@ class InferenceService:
                                        processed=False, reason="out_of_order",
                                        server_ms=_ms(started))
             session.last_ts = ts_ms
-            perception = await self._perceive(session, camera_id, image, ts_ms)
             policy = settings or DetectionSettings()
+            session.last_frame_monotonic = time.perf_counter()
+            perception = await self._perceive(session, camera_id, image, ts_ms, policy=policy)
             events = [_server_event(event) for event in perception.events
                       if _allowed_event(event, policy, perception.observation)]
             if perception.observation is not None:
@@ -267,18 +279,29 @@ class InferenceService:
                                server_ms=_ms(started))
 
     async def _perceive(self, session: _Session, camera_id: str, image, ts_ms: int,
-                        *, confirm: bool = False):
+                        *, confirm: bool = False, policy: DetectionSettings | None = None):
         """Discard broken temporal state so the next fresh frame can recover."""
         attribute = "confirm" if confirm else "stream"
         try:
             detector = getattr(session, attribute)
+            cancelled = []
+            config = CONFIRM_CONFIG if confirm else _detector_config(policy or DetectionSettings())
+            if not confirm and detector is not None and session.stream_config != config:
+                # Apply threshold and model changes to a new temporal session.
+                if hasattr(detector, "cancel_candidates"):
+                    cancelled = detector.cancel_candidates(ts_ms)
+                await asyncio.to_thread(detector.close)
+                detector = None
             if detector is None:
                 detector = await asyncio.to_thread(
-                    self._factory, camera_id, CONFIRM_CONFIG if confirm else {},
+                    self._factory, camera_id, config,
                     lambda: session.captured_at)
                 setattr(session, attribute, detector)
+                if not confirm:
+                    session.stream_config = config
             async with self._cpu:
-                return await asyncio.to_thread(detector.perceive, image, ts_ms)
+                result = await asyncio.to_thread(detector.perceive, image, ts_ms)
+                return Perception(events=cancelled + result.events, observation=result.observation)
         except Exception as exc:  # noqa: BLE001 -- expose only a safe error type
             session.failed = True
             async with self._sessions_lock:
@@ -292,6 +315,38 @@ class InferenceService:
                 f"Camera inference unavailable ({type(exc).__name__}); retry a fresh frame") from exc
 
     # -- sessions ----------------------------------------------------------------
+    async def _timers(self):
+        while True:
+            await asyncio.sleep(0.1)
+            try:
+                await self.tick()
+            except Exception as exc:
+                log.error("fall timer persistence failed (%s)", type(exc).__name__)
+
+    async def tick(self):
+        """Expire confirmations without relying on another upload.
+
+        Keep events in a retry buffer until the same durable dispatcher commits.
+        Stream time advances from the last received frame using a monotonic
+        server clock; wall-clock changes cannot shorten confirmation.
+        """
+        for key, session in list(self._sessions.items()):
+            async with session.lock:
+                if session.stream is None or session.last_ts is None or not hasattr(session.stream, "advance"):
+                    continue
+                elapsed = time.perf_counter() - session.last_frame_monotonic
+                # Do not call a live 7 fps track missing between normal frames.
+                if elapsed < 0.3:
+                    continue
+                ts_ms = session.last_ts + int(elapsed * 1000)
+                pending = await asyncio.to_thread(session.stream.advance, ts_ms)
+                if pending:
+                    self._timer_pending.append((key[0], key[1], [_server_event(e) for e in pending]))
+        while self._timer_pending and self._timer_events is not None:
+            agent_id, camera_id, events = self._timer_pending[0]
+            await self._timer_events(agent_id, camera_id, events)
+            self._timer_pending.pop(0)
+
     async def _session(self, agent_id: str, camera_id: str, session_id: str) -> _Session:
         key = (agent_id, camera_id, session_id)
         expired: list[_Session] = []
@@ -330,13 +385,17 @@ class InferenceService:
 
 def _server_event(event: FallEvent) -> FallEvent:
     """Mark server-detected events so history can tell them apart."""
-    return event.model_copy(update={"signals": {**event.signals, "server_inference": 1.0}})
+    return event.model_copy(update={"signals": {**event.signals, "server_inference": 1.0,
+        "server_detected_at_ms": datetime.now(timezone.utc).timestamp() * 1000}})
 
 
 def _allowed_event(event: FallEvent, settings: DetectionSettings, observation) -> bool:
     if event.kind is not EventKind.FALL:
         return True
-    if not settings.fall.enabled or event.confidence < settings.fall.min_confidence:
+    candidate = event.signals.get("research_candidate") == 1
+    if candidate and (not settings.fall.enabled or event.confidence < settings.fall.min_confidence):
+        event.signals["alert_suppressed"] = 1.0
+    if not candidate and (not settings.fall.enabled or event.confidence < settings.fall.min_confidence):
         return False
     excluded = settings.zones_of(ZoneKind.EXCLUDED)
     if not excluded:
@@ -344,7 +403,19 @@ def _allowed_event(event: FallEvent, settings: DetectionSettings, observation) -
     person = next((p for p in observation.people if p.track_id == event.track_id), None) \
         if observation is not None else None
     # Unknown geometry cannot establish that this fall is outside an exclusion.
+    if candidate and all(k in event.signals for k in ("bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2")):
+        x = (event.signals["bbox_x1"] + event.signals["bbox_x2"]) / 2
+        y = event.signals["bbox_y2"]
+        if zone_at(x, y, excluded) is not None:
+            event.signals["alert_suppressed"] = 1.0
+        return True  # All candidates remain available for camera tuning.
     return person is not None and zone_at(*person.anchor, excluded) is None
+
+
+def _detector_config(settings: DetectionSettings) -> dict:
+    fall = settings.fall.model_dump()
+    return {"fall_model": fall.pop("model"), "fall_confirmation": fall,
+            "zones": [zone.model_dump(mode="json") for zone in settings.zones]}
 
 
 def _ms(started: float) -> float:

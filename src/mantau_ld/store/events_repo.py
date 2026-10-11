@@ -149,6 +149,32 @@ class EventsRepo:
         await self._db.conn.commit()
         return cursor.rowcount > 0
 
+    async def update_candidate(self, event: FallEvent, *, household_id: str, agent_id: str) -> bool:
+        """Advance a pending research candidate exactly once, under its owner.
+
+        History cursor and human review fields are preserved. Terminal states
+        cannot regress to pending when an upload or timer callback is retried.
+        """
+        if event.signals.get("research_candidate") != 1:
+            return False
+        cursor = await self._db.conn.execute(
+            "UPDATE events SET severity=?,confidence=?,signals_json=? "
+            "WHERE event_id=? AND household_id=? AND agent_id=? AND camera_id=? "
+            "AND json_extract(signals_json,'$.research_candidate')=1 "
+            "AND json_extract(signals_json,'$.candidate_outcome')=0 "
+            "AND (? != 0 OR COALESCE(json_extract(signals_json,'$.candidate_progress_s'),0)<=?)",
+            (event.severity.value, event.confidence, json.dumps(event.signals),
+             event.event_id, household_id, agent_id, event.camera_id,
+             event.signals.get("candidate_outcome", 0), event.signals.get("candidate_progress_s", 0)))
+        await self._db.conn.commit()
+        return cursor.rowcount > 0
+
+    async def pending_candidates(self):
+        rows = await (await self._db.conn.execute(
+            "SELECT * FROM events WHERE json_extract(signals_json,'$.research_candidate')=1 "
+            "AND json_extract(signals_json,'$.candidate_outcome')=0")).fetchall()
+        return [(row["household_id"], row["agent_id"], _row_to_event(row)) for row in rows]
+
     async def list_for_household(self, household_id: str, *, limit: int = 100) -> list[FallEvent]:
         cursor = await self._db.conn.execute(
             "SELECT * FROM events WHERE household_id=? ORDER BY created_at DESC LIMIT ?",

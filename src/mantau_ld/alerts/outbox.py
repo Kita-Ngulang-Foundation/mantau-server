@@ -54,7 +54,12 @@ class PushOutbox:
         async with self.db.transaction():
             inserted = await self.events.insert(event, household_id=household_id, agent_id=agent_id)
             if not inserted:
-                return False
+                inserted = await self.events.update_candidate(event, household_id=household_id, agent_id=agent_id)
+                if not inserted:
+                    return False
+            if event.signals.get("research_candidate") == 1 and (
+                    event.signals.get("candidate_outcome") != 1 or event.signals.get("alert_suppressed") == 1):
+                return True  # History only; never resolve push recipients.
             name = await self.cameras.name_for(event.camera_id, household_id)
             title, body = render(event, camera_name=name)
             alert = Alert.from_event(event, camera_name=name, title=title, body=body)

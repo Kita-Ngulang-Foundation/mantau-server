@@ -34,10 +34,16 @@ class AlertDispatcher:
         self.outbox.trace_for = self.get_trace
 
     async def dispatch(self, event: FallEvent, *, household_id: str, agent_id: str, deliver: bool = True) -> None:
+        candidate = event.signals.get("research_candidate") == 1
+        # Pending/recovered candidates are history entries, not alert traces.
+        if candidate and event.signals.get("candidate_outcome") != 1:
+            await self.outbox.enqueue(event, household_id, agent_id)
+            return
         if event.event_id not in self.traces:
             trace = LatencyTrace(event.event_id)
             trace.stamp(Stage.CAPTURED, at=event.occurred_at.timestamp())
-            trace.stamp(Stage.DETECTED, at=event.occurred_at.timestamp())
+            detected_at = (event.signals.get("server_detected_at_ms", event.occurred_at.timestamp() * 1000) / 1000)
+            trace.stamp(Stage.DETECTED, at=detected_at if candidate else event.occurred_at.timestamp())
             self.traces[event.event_id] = trace
 
         await self.outbox.enqueue(event, household_id, agent_id)
