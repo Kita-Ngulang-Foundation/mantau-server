@@ -7,7 +7,6 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
 from ...store.control_repo import ControlRepo
 from ..deps import get_control_repo
-from .agents import _agent_status
 
 router = APIRouter(prefix="/internal", tags=["internal"])
 
@@ -28,14 +27,21 @@ async def fleet(request: Request, response: Response,
                 control: ControlRepo = Depends(get_control_repo)) -> dict:
     response.headers["Cache-Control"] = "private, no-store"
     cutoff = request.app.state.settings.agent_offline_after_s
+    frame_cutoff = 15
+    now = time.time()
     agents = []
     for row in await control.enrolled_fleet():
-        status = _agent_status(row, cutoff)
+        contact = row["last_seen_at"]
+        frame = row["last_frame_received_at"]
+        fresh_frame = frame is not None and now - frame <= frame_cutoff
+        connected = contact is not None and now - contact <= cutoff
+        status = "online" if fresh_frame else "connected" if connected else "offline"
         agents.append({
-            "agent_id": row["agent_id"], "name": status["name"],
+            "agent_id": row["agent_id"], "name": row["name"] or row["agent_id"],
             "household_id": row["household_id"], "household_name": row["household_name"],
-            "platform": status["platform"] or "unknown",
+            "platform": row["platform"] or "unknown",
             "enrolled_at": row["enrolled_at"], "last_contact_at": row["last_seen_at"],
-            "status": "offline" if status["health_state"] == "offline" else "online",
+            "last_frame_received_at": frame, "status": status,
         })
-    return {"generated_at": time.time(), "offline_after_s": cutoff, "agents": agents}
+    return {"generated_at": now, "offline_after_s": cutoff,
+            "frame_stale_after_s": frame_cutoff, "agents": agents}

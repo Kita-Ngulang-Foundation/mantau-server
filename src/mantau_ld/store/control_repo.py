@@ -60,7 +60,7 @@ class ControlRepo:
     async def enrolled_fleet(self):
         cursor = await self._db.conn.execute(
             "SELECT a.agent_id,a.name,a.household_id,a.enrolled_at,a.last_seen_at,"
-            "a.last_frame_at,a.last_inference_at,h.name AS household_name,s.* FROM agents a "
+            "a.last_frame_at,a.last_inference_at,a.last_frame_received_at,h.name AS household_name,s.* FROM agents a "
             "LEFT JOIN households h ON h.household_id=a.household_id "
             "LEFT JOIN agent_control_state s ON s.agent_id=a.agent_id "
             "WHERE a.revoked_at IS NULL ORDER BY a.enrolled_at DESC,a.agent_id"
