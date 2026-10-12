@@ -8,11 +8,12 @@ request body can never name someone else.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from mantau_core.notify.delivery import AckService
 from mantau_core.telemetry import Stage
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from ...alerts.dispatcher import AlertDispatcher
 from ...control_auth import authenticated_user
@@ -21,6 +22,9 @@ from ...store.identity_repo import UserPrincipal
 from ..deps import get_ack_service, get_dispatcher, get_events_repo
 
 router = APIRouter(prefix="/events", tags=["events"])
+
+DismissReason = Literal["kejadian_ringan", "tidak_ada_kejadian", "lainnya"]
+LATENCY_BUDGET_S = 5.0
 
 
 def _ts(value: float | None) -> datetime | None:
@@ -49,6 +53,8 @@ class EventOut(BaseModel):
     # HYBRID: did server inference also see someone lying down? None = not asked.
     server_confirmed: bool | None = None
     server_confirmation_confidence: float | None = None
+    # Why a dismissed event was dismissed. The free-text note is not listed here.
+    dismiss_reason: str | None = None
 
     @classmethod
     def from_record(cls, record: EventRecord) -> "EventOut":
@@ -66,7 +72,18 @@ class EventOut(BaseModel):
             recording_permitted=record.recording_permitted and event.kind.value != "bathroom_duration",
             server_confirmed=record.server_confirmed,
             server_confirmation_confidence=record.server_confirmation_confidence,
+            dismiss_reason=record.dismiss_reason,
         )
+
+
+class EventDetailOut(EventOut):
+    """Single-event response: the only place the dismiss note is returned."""
+    dismiss_note: str | None = None
+
+    @classmethod
+    def from_record(cls, record: EventRecord) -> "EventDetailOut":
+        base = EventOut.from_record(record)
+        return cls(**base.model_dump(), dismiss_note=record.dismiss_note)
 
 
 async def _record(repo: EventsRepo, principal: UserPrincipal, event_id: str) -> EventRecord:
@@ -88,13 +105,13 @@ async def list_events(
     return [EventOut.from_record(r) for r in records]
 
 
-@router.get("/{event_id}", response_model=EventOut)
+@router.get("/{event_id}", response_model=EventDetailOut)
 async def get_event(
     event_id: str,
     repo: EventsRepo = Depends(get_events_repo),
     principal: UserPrincipal = Depends(authenticated_user),
-) -> EventOut:
-    return EventOut.from_record(await _record(repo, principal, event_id))
+) -> EventDetailOut:
+    return EventDetailOut.from_record(await _record(repo, principal, event_id))
 
 
 class AckRequest(BaseModel):
@@ -130,8 +147,31 @@ async def ack_event(
 
 class LatencyOut(BaseModel):
     event_id: str
-    summary: dict[str, float | None]      # LatencyTrace.to_summary() -- seconds since captured
+    summary: dict[str, float | None]      # seconds since captured, per stage
     within_budget_delivered: bool | None   # None if not measurable yet
+
+
+def _latency_from_columns(event_id: str, row: dict) -> LatencyOut:
+    """Same shape as LatencyTrace.to_summary(), built from the stored columns."""
+    base = row["captured_at"]
+
+    def since(column: str) -> float | None:
+        value = row[column]
+        return None if value is None else value - base
+
+    delivered = since("first_delivered_at")
+    return LatencyOut(
+        event_id=event_id,
+        summary={
+            "captured": 0.0,
+            "detected": since("detected_at"),
+            "queued": since("queued_at"),
+            "sent": since("first_sent_at"),
+            "delivered": delivered,
+            "acked": since("acknowledged_at"),
+        },
+        within_budget_delivered=None if delivered is None else delivered <= LATENCY_BUDGET_S,
+    )
 
 
 @router.get("/{event_id}/latency", response_model=LatencyOut)
@@ -142,27 +182,50 @@ async def get_latency(
     principal: UserPrincipal = Depends(authenticated_user),
 ) -> LatencyOut:
     """Per-stage breakdown behind the claim: under 5 seconds, captured to
-    delivered."""
+    delivered. Stored timestamps win; the in-memory trace is the fallback."""
     await _record(repo, principal, event_id)
+    row = await repo.latency(principal.household_id, event_id)
+    if row is not None and row["captured_at"] is not None:
+        return _latency_from_columns(event_id, row)
     trace = dispatcher.get_trace(event_id)
     if trace is None:
         return LatencyOut(event_id=event_id, summary={}, within_budget_delivered=None)
     return LatencyOut(event_id=event_id, summary=trace.to_summary(),
-                      within_budget_delivered=trace.within_budget(5.0))
+                      within_budget_delivered=trace.within_budget(LATENCY_BUDGET_S))
 
 
 class StatusRequest(BaseModel):
     status: str  # "dismissed" | "confirmed" | "needs_review"
+    # Only with status "dismissed". Older app builds send none; that is accepted.
+    reason: DismissReason | None = None
+    # Only with reason "lainnya". Stripped; blank becomes None.
+    note: str | None = Field(default=None, max_length=200)
+
+    @field_validator("note", mode="before")
+    @classmethod
+    def _strip_note(cls, value):
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
+
+    @model_validator(mode="after")
+    def _dismiss_fields_only_when_dismissed(self) -> "StatusRequest":
+        if self.status != "dismissed" and (self.reason is not None or self.note is not None):
+            raise ValueError("reason_and_note_only_when_dismissed")
+        if self.note is not None and self.reason != "lainnya":
+            raise ValueError("note_only_with_reason_lainnya")
+        return self
 
 
-@router.post("/{event_id}/status", response_model=EventOut)
+@router.post("/{event_id}/status", response_model=EventDetailOut)
 async def set_status(
     event_id: str, body: StatusRequest,
     repo: EventsRepo = Depends(get_events_repo),
     principal: UserPrincipal = Depends(authenticated_user),
-) -> EventOut:
+) -> EventDetailOut:
     await _record(repo, principal, event_id)
     if body.status not in VALID_STATUSES:
         raise HTTPException(400, "invalid_status")
-    await repo.review(principal.household_id, event_id, body.status, principal.user_id)
-    return EventOut.from_record(await _record(repo, principal, event_id))
+    await repo.review(principal.household_id, event_id, body.status, principal.user_id,
+                      reason=body.reason, note=body.note)
+    return EventDetailOut.from_record(await _record(repo, principal, event_id))

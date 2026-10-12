@@ -23,11 +23,34 @@ class PushOutbox:
         self.wake = asyncio.Event()
         self.worker = None
         self.trace_for = None
+        self.telemetry = None
+        # Set by enqueue(): when the event was queued, None if it was not.
+        self.last_queued_at = None
 
-    def _stamp(self, event_id, stage):
+    def _stamp(self, event_id, stage, at=None):
+        """Stamp the trace and return the time used, so the same time can be persisted."""
         trace = self.trace_for(event_id) if self.trace_for is not None else None
+        if at is None:
+            at = trace.clock() if trace is not None else time.time()
         if trace is not None and not trace.has(stage):
-            trace.stamp(stage)
+            trace.stamp(stage, at=at)
+        return at
+
+    async def _persist_delivery(self, row, column, first_column, at):
+        """Telemetry only: the row's own sent/delivered time, and the event's first one."""
+        if self.telemetry is None:
+            return
+        try:
+            await self.telemetry.stamp_outbox(row['id'], row['household_id'], column, at)
+            await self.telemetry.stamp_event(row['event_id'], row['household_id'], **{first_column: at})
+        except Exception as exc:  # noqa: BLE001 -- telemetry never blocks a push
+            log.warning("delivery telemetry dropped (%s)", type(exc).__name__)
+
+    async def _log_unregistered(self, row):
+        try:
+            await self.telemetry.log_token_unregistered(row['household_id'], row['user_id'], time.time())
+        except Exception as exc:  # noqa: BLE001 -- telemetry never blocks a push
+            log.warning("token telemetry dropped (%s)", type(exc).__name__)
 
     async def start(self):
         if self.worker is not None and not self.worker.done():
@@ -51,6 +74,7 @@ class PushOutbox:
             await self.db.conn.commit()
 
     async def enqueue(self, event, household_id, agent_id):
+        self.last_queued_at = None
         async with self.db.transaction():
             inserted = await self.events.insert(event, household_id=household_id, agent_id=agent_id)
             if not inserted:
@@ -83,12 +107,14 @@ class PushOutbox:
                         (event.event_id, household_id, channel, recipient['token'],
                          alert.model_dump_json(), recipient['user_id'], recipient['device_id']))
         self.wake.set()
-        self._stamp(event.event_id, Stage.QUEUED)
+        # No await between this and the caller's read, so the value is the caller's.
+        self.last_queued_at = self._stamp(event.event_id, Stage.QUEUED)
         return True
 
     async def deliver_pending(self):
         if self.db.in_atomic:
             raise RuntimeError("Push delivery must follow the enclosing transaction commit")
+        delivered = []
         async with self.lock:
             async with self.db.serialized():
                 rows = await (await self.db.conn.execute(
@@ -112,17 +138,21 @@ class PushOutbox:
                 if state != 'sending' or claimed.rowcount != 1:
                     continue
                 state, reason = 'delivered', None
-                self._stamp(row['event_id'], Stage.SENT)
+                # No telemetry DB work between the claim and the send: the sent time is
+                # kept in memory and persisted after the product state commit below.
+                sent_at = self._stamp(row['event_id'], Stage.SENT)
+                delivered_at = unregistered = None
                 try:
                     delivery = await asyncio.wait_for(self.fanout.channels[row['channel']].notifier.send(
                         Alert.model_validate_json(row['alert_json']), row['target']), timeout=12)
                     if delivery.status is not DeliveryStatus.DELIVERED:
                         state, reason = 'pending', 'delivery_failed'
                     else:
-                        self._stamp(row['event_id'], Stage.DELIVERED)
+                        delivered_at = self._stamp(row['event_id'], Stage.DELIVERED)
                 except PushDeliveryError as exc:
                     reason = exc.kind.value
                     state = 'failed' if exc.kind in (PushErrorKind.UNREGISTERED, PushErrorKind.INVALID) else 'pending'
+                    unregistered = exc.kind is PushErrorKind.UNREGISTERED
                     delivery = Delivery(event_id=row['event_id'], status=DeliveryStatus.FAILED,
                                         detail=reason)
                 except Exception as exc:
@@ -137,6 +167,15 @@ class PushOutbox:
                         "UPDATE push_outbox SET state=?,next_attempt_at=?,last_error=? WHERE id=?",
                         (state, time.time()+min(300, 2 ** attempts), reason, row['id']))
                     await self.db.conn.commit()
+                delivered.append((row, sent_at, delivered_at, unregistered))
+        # Telemetry only after every recipient of this batch had its push, so no
+        # family member's alert waits on a telemetry write.
+        for row, sent_at, delivered_at, unregistered in delivered:
+            await self._persist_delivery(row, 'sent_at', 'first_sent_at', sent_at)
+            if delivered_at is not None:
+                await self._persist_delivery(row, 'delivered_at', 'first_delivered_at', delivered_at)
+            if unregistered and self.telemetry is not None:
+                await self._log_unregistered(row)
 
     async def run(self):
         while True:

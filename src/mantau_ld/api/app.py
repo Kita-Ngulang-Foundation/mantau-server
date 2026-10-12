@@ -39,6 +39,7 @@ from ..store.identity_repo import IdentityRepo
 from ..store.inference_repo import InferenceRepo
 from ..store.recipient_resolver import SqliteRecipientResolver
 from ..store.sync_db import SyncDatabase
+from ..store.telemetry_repo import TelemetryRepo
 from ..store.token_store import SqliteTokenStore
 log = logging.getLogger("mantau_ld")
 # aiosqlite logs every statement with its parameters at DEBUG, which would put
@@ -47,7 +48,7 @@ logging.getLogger("aiosqlite").setLevel(logging.INFO)
 
 from .routes import (  # noqa: E402
     agents, cameras, contacts, control, detection, devices, events, frames, health, households,
-    inference, ingest, recordings,
+    inference, ingest, missed, recordings, usage,
 )
 
 
@@ -102,9 +103,11 @@ def create_app(
         events_repo = EventsRepo(db)
         token_store = SqliteTokenStore(sync_db)
         resolver = SqliteRecipientResolver(sync_db, token_store)
+        detection_settings_repo = DetectionSettingsRepo(db)
+        telemetry_repo = TelemetryRepo(db, settings=settings)
 
         fanout = Fanout(channels=_build_channels(settings, resolver, token_store, push_notifier), tracker=DeliveryTracker())
-        dispatcher = AlertDispatcher(events_repo, cameras_repo, fanout)
+        dispatcher = AlertDispatcher(events_repo, cameras_repo, fanout, telemetry=telemetry_repo)
 
         app.state.settings = settings
         app.state.db = db
@@ -117,11 +120,12 @@ def create_app(
         app.state.token_store = token_store
         app.state.resolver = resolver
         app.state.dispatcher = dispatcher
+        app.state.telemetry_repo = telemetry_repo
         app.state.ack_service = AckService()
         app.state.frames = FrameStore()
         app.state.agent_recordings_repo = AgentRecordingsRepo(db)
         app.state.recording_relay = RecordingRelay(max_bytes=settings.recording_max_bytes)
-        app.state.detection_settings_repo = DetectionSettingsRepo(db)
+        app.state.detection_settings_repo = detection_settings_repo
         app.state.recordings_repo = RecordingsRepo(db, settings.recordings_dir,
             household_max_bytes=settings.recording_household_max_bytes,
             global_max_bytes=settings.recording_global_max_bytes)
@@ -144,7 +148,8 @@ def create_app(
                         await dispatcher.dispatch(event, household_id=camera.household_id,
                                                   agent_id=camera.agent_id, deliver=False)
         app.state.inference = InferenceService(
-            settings, factory=inference_factory, decoder=inference_decoder, timer_events=timer_events)
+            settings, factory=inference_factory, decoder=inference_decoder, timer_events=timer_events,
+            minute_sink=telemetry_repo.upsert_minutes)
         await app.state.inference.start()
 
         await dispatcher.outbox.start()
@@ -232,4 +237,6 @@ def create_app(
     app.include_router(detection.router)
     app.include_router(recordings.router)
     app.include_router(inference.router)
+    app.include_router(missed.router)
+    app.include_router(usage.router)
     return app

@@ -56,3 +56,57 @@ alarm. A provider delivery acknowledgement is not a caregiver read receipt.
 Release remains gated on a verified runtime backup, isolated staging fault
 tests, real camera/model evaluation, signed upgrade installation and physical
 phone/Pi recovery and endurance. Do not fault-test the production environment.
+
+## Field trial telemetry
+
+The trial's telemetry lives in the same SQLite database as everything else, so
+the database must survive redeploys before any household joins.
+
+Pre-install gates:
+
+- **G1, persistent volume.** The service must mount a persistent volume at
+  `/data` with `MANTAU_DB_PATH=/data/mantau_ld.db`. Without the volume, a
+  redeploy deletes the whole database. Redeploy once and confirm that an
+  existing event survives it.
+- **G2, build id.** `GET /health` reports the running build under `build`
+  (`server`, `core`, `ai`). The server reads `MANTAU_BUILD_ID`, then
+  `RAILWAY_GIT_COMMIT_SHA`, then `unknown`. After deploy, confirm the build id
+  is non-empty and record which variable Railway sets.
+
+Cohort rules:
+
+- Telemetry is written only for households in `trial_cohort`, and only inside
+  their trial dates. Add a household only after its participation agreement is
+  signed.
+
+Commands (run from `/app` in the server container against the live database
+file; they wait for locks):
+
+```sh
+python ops/trial_cohort.py --db /data/mantau_ld.db add --household ID --code H01 --start 2026-10-20 --end 2026-11-02 --tz Asia/Jakarta
+python ops/trial_cohort.py --db /data/mantau_ld.db end --household ID --date 2026-11-02
+python ops/trial_cohort.py --db /data/mantau_ld.db list
+python ops/trial_cohort.py --db /data/mantau_ld.db missed --household ID --from 2026-10-21T07:00 --to 2026-10-21T08:00 --kind fall
+python ops/trial_export.py --db /data/mantau_ld.db --out DIR --kind engineering [--include-notes]
+python ops/trial_export.py --db /data/mantau_ld.db --out DIR --kind investor
+```
+
+- `missed` records a fall, stillness, nocturnal movement, bathroom duration or
+  other event that a family reported to the team over WhatsApp. It stores no
+  free text, accepts windows of at most 24 hours, and a naive time is read in
+  the household's cohort time zone.
+- `trial_export.py` reads a read-only snapshot and writes only into `--out`,
+  which must be empty or missing. `--kind engineering` writes combined CSV
+  files, one per table, with every row keyed by cohort code in the `household`
+  column; cameras, agents and members appear as indexes that are unique within
+  a household. `--include-notes` adds the free-text dismiss note to
+  `events.csv` and nowhere else.
+  `--kind investor` writes `summary.csv` only. Each figure needs at least 3
+  contributing households, and latency percentiles also need at least 10
+  samples; otherwise the figure is suppressed. With fewer than 3 cohort
+  households the file has only its header.
+- The tz database must be present: the python slim image ships tzdata. To run
+  the scripts on Windows against a copy of the database, install the `tzdata`
+  package first.
+- Exports contain pseudonymous, not anonymous, data. Store them privately,
+  restrict access to them, and keep them out of the repository.

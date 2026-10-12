@@ -3,12 +3,15 @@ from __future__ import annotations
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from ...config import build_info
+
 router = APIRouter(tags=["health"])
 
 
 @router.get("/health")
-async def health() -> dict:
-    return {"status": "ok"}
+async def health(request: Request) -> dict:
+    settings = getattr(request.app.state, "settings", None)
+    return {"status": "ok", "build": build_info(settings)}
 
 
 @router.get("/ready")
