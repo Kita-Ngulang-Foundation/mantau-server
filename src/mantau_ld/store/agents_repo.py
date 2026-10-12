@@ -206,10 +206,12 @@ class AgentsRepo:
             (agent_id,))).fetchone()
         return bool(row and row[0])
 
-    async def touch(self, agent_id: str, *, at: float | None = None) -> None:
+    async def touch(self, agent_id: str, *, at: float | None = None, frame_received: bool = False) -> None:
+        now = at if at is not None else time.time()
         await self._db.conn.execute(
-            "UPDATE agents SET last_seen_at=? WHERE agent_id=? AND revoked_at IS NULL",
-            (at or time.time(), agent_id),
+            "UPDATE agents SET last_seen_at=?,last_frame_received_at=CASE WHEN ? "
+            "THEN ? ELSE last_frame_received_at END WHERE agent_id=? AND revoked_at IS NULL",
+            (now, frame_received, now, agent_id),
         )
         await self._db.conn.commit()
 
