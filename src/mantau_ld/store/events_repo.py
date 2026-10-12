@@ -189,12 +189,13 @@ class EventsRepo:
         if event.signals.get("research_candidate") != 1:
             return False
         cursor = await self._db.conn.execute(
-            "UPDATE events SET severity=?,confidence=?,signals_json=? "
+            # zone_id is set when a candidate resolves as rest in a zone.
+            "UPDATE events SET severity=?,confidence=?,signals_json=?,zone_id=COALESCE(?,zone_id) "
             "WHERE event_id=? AND household_id=? AND agent_id=? AND camera_id=? "
             "AND json_extract(signals_json,'$.research_candidate')=1 "
             "AND json_extract(signals_json,'$.candidate_outcome')=0 "
             "AND (? != 0 OR COALESCE(json_extract(signals_json,'$.candidate_progress_s'),0)<=?)",
-            (event.severity.value, event.confidence, json.dumps(event.signals),
+            (event.severity.value, event.confidence, json.dumps(event.signals), event.zone_id,
              event.event_id, household_id, agent_id, event.camera_id,
              event.signals.get("candidate_outcome", 0), event.signals.get("candidate_progress_s", 0)))
         await self._db.conn.commit()
