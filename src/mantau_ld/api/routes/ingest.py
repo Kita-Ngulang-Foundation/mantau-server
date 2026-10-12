@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import time
+
 from fastapi import APIRouter, Depends, HTTPException
 from mantau_core.contracts import Envelope, PayloadKind
 from pydantic import BaseModel
@@ -14,7 +16,8 @@ from ...ingest.verify import VerificationError, verify_envelope
 from ...store.agents_repo import AgentsRepo
 from ...store.cameras_repo import CamerasRepo
 from ...store.db import Database
-from ..deps import get_agents_repo, get_cameras_repo, get_db, get_dispatcher
+from ...store.telemetry_repo import TelemetryRepo
+from ..deps import get_agents_repo, get_cameras_repo, get_db, get_dispatcher, get_telemetry_repo
 
 router = APIRouter(tags=["ingest"])
 
@@ -32,6 +35,7 @@ async def ingest(
     cameras: CamerasRepo = Depends(get_cameras_repo),
     db: Database = Depends(get_db),
     dispatcher: AlertDispatcher = Depends(get_dispatcher),
+    telemetry: TelemetryRepo = Depends(get_telemetry_repo),
 ) -> IngestResponse:
     try:
         await verify_envelope(envelope, agents)
@@ -61,6 +65,10 @@ async def ingest(
         await agents.touch(envelope.agent_id)
         if not result.duplicate and envelope.kind is PayloadKind.FALL_EVENT:
             await dispatcher.dispatch(event, household_id=agent.household_id, agent_id=agent.agent_id, deliver=False)
+    received_at = time.time()
     await dispatcher.outbox.deliver_pending()
+    # After the commit and the push, best effort: late or spooled heartbeats are expected.
+    if heartbeat is not None and not result.duplicate:
+        await telemetry.log_heartbeat(agent.household_id, heartbeat, received_at)
 
     return IngestResponse(status="accepted", duplicate=result.duplicate, out_of_order=result.out_of_order)

@@ -177,7 +177,7 @@ async def infer(
                         agent_id=agent_id, camera_id=camera_id, session_id=session_id,
                         frame_id=frame_id, ts_ms=ts_ms, captured_at=captured_at,
                         event_ids=tuple(e for e in event_ids if e not in foreign), jpeg=body,
-                        settings=camera_settings)
+                        settings=camera_settings, household_id=household_id)
                     if foreign:
                         result = result.model_copy(update={'confirmations': [
                             *result.confirmations,
