@@ -123,7 +123,10 @@ async def infer(
         raise HTTPException(401, "unauthorized")
     if await cameras.get_for_agent(agent_id, camera_id) is None:
         raise HTTPException(404, "resource_not_found")
-    await agents.touch(agent_id)
+    received_ms = datetime.now(timezone.utc).timestamp() * 1000
+    fresh_upload = (bool(body) and -settings.inference_max_clock_skew_s * 1000
+                    <= received_ms - captured_at_ms <= settings.inference_max_frame_age_s * 1000)
+    await agents.touch(agent_id, frame_received=fresh_upload)
     async def failed_processing():
         async with request.app.state.db.serialized():
             await request.app.state.db.conn.execute(

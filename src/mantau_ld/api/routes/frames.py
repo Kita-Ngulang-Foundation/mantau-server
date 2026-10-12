@@ -67,6 +67,7 @@ async def push_frame(
             camera_id, body, household_id=agent.household_id, agent_id=x_mantau_agent,
             captured_at_ms=x_mantau_captured_at,
         )
+        await agents.touch(x_mantau_agent, frame_received=True)
     # Tells the agent whether anyone is watching, so it sends video-rate
     # frames only while a family member has the live view open.
     return Response(status_code=204,

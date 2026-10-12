@@ -394,6 +394,7 @@ async def _migrate_existing(conn: aiosqlite.Connection) -> None:
     await _add_column(conn, "agents", "credential_version INTEGER NOT NULL DEFAULT 1")
     await _add_column(conn, "agents", "name TEXT")
     await _add_column(conn, "agents", "last_frame_at REAL")
+    await _add_column(conn, "agents", "last_frame_received_at REAL")
     await _add_column(conn, "agents", "last_inference_at REAL")
     await _add_column(conn, "agents", "local_recordings_supported INTEGER NOT NULL DEFAULT 0")
     await _add_column(conn, "agents", "stream_settings_supported INTEGER NOT NULL DEFAULT 0")
