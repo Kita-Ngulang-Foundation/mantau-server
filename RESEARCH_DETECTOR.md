@@ -18,11 +18,15 @@ explicit `tau_loose` and `tau_high` thresholds instead.
 Research candidates are stored in `events` under the camera's household and
 agent, with one event id from candidacy through resolution. `signals` records
 `peak_p`, `down_fraction`, `tier` (1=A, 2=B), `candidate_outcome` (0=pending,
-1=confirmed, 2=got up, 3=insufficient down, 4=settings changed), and timing.
-Only outcome 1 enters the FCM outbox; configured exclusions/disabled detection
-also suppress delivery. Half-second snapshots support recovery after restart.
-An independent timer confirms a lost track last seen down at its original
-deadline, including when uploads stop. Restart downtime can delay delivery.
+1=confirmed, 2=got up, 3=insufficient down, 4=settings changed, 5=rest in a
+bed or seating zone), and timing. Outcome 5 events carry that zone's `zone_id`.
+The camera's bed and seating zones reach the confirm step: a candidate whose
+person rests in one (hip midpoint inside it for `down_share` of the down
+frames) resolves as 5 instead of confirming. Only outcome 1 enters the FCM
+outbox; configured exclusions/disabled detection also suppress delivery.
+Half-second snapshots support recovery after restart. An independent timer
+confirms a lost track last seen down at its original deadline, including
+when uploads stop. Restart downtime can delay delivery.
 
 Latency traces start at candidate frame capture and stamp confirmation separately
 from FCM submission. FCM transport acceptance does not measure phone receipt;
