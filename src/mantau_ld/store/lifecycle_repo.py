@@ -81,7 +81,9 @@ class LifecycleRepo:
                 shutil.rmtree(household_root)
             for table in ('push_outbox', 'inference_confirmations', 'recordings', 'events',
                           'camera_detection_settings', 'cameras', 'queued_commands',
-                          'device_tokens', 'emergency_contacts', 'agent_enrollment_keys'):
+                          'device_tokens', 'emergency_contacts', 'agent_enrollment_keys',
+                          'heartbeat_log', 'camera_minutes', 'missed_reports', 'usage_events',
+                          'trial_cohort'):
                 await self._db.conn.execute(f'DELETE FROM {table} WHERE household_id=?', (household_id,))
             await self._db.conn.execute(
                 'DELETE FROM ingested_envelopes WHERE agent_id IN (SELECT agent_id FROM agents WHERE household_id=?)',
@@ -107,6 +109,10 @@ class LifecycleRepo:
                     (fingerprint, time.time()))
             await self._db.conn.execute('DELETE FROM device_tokens WHERE user_id=?', (user_id,))
             await self._db.conn.execute('DELETE FROM push_outbox WHERE user_id=?', (user_id,))
+            await self._db.conn.execute('DELETE FROM usage_events WHERE user_id=?', (user_id,))
+            # Missed-event reports stay with the household; only the author link is removed (team decision).
+            await self._db.conn.execute(
+                'UPDATE missed_reports SET reported_by=NULL WHERE reported_by=?', (user_id,))
             await self._db.conn.execute('UPDATE queued_commands SET requested_by_user_id=NULL WHERE requested_by_user_id=?', (user_id,))
             # Legacy owner_id is part of an idempotency uniqueness key. A
             # command-specific tombstone avoids collisions between deletions.

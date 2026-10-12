@@ -47,6 +47,9 @@ class EventRecord:
     # Latest server-inference confirmation (HYBRID) from the event's own agent.
     server_confirmed: bool | None = None
     server_confirmation_confidence: float | None = None
+    # Why the household dismissed the event (only while status is "dismissed").
+    dismiss_reason: str | None = None
+    dismiss_note: str | None = None
 
 
 _RECORD_SQL = (
@@ -73,6 +76,8 @@ def _row_to_record(row: aiosqlite.Row) -> EventRecord:
         server_confirmed=(None if row["server_confirmed"] is None
                           else bool(row["server_confirmed"])),
         server_confirmation_confidence=row["server_confidence"],
+        dismiss_reason=row["dismiss_reason"] if "dismiss_reason" in row.keys() else None,
+        dismiss_note=row["dismiss_note"] if "dismiss_note" in row.keys() else None,
     )
 
 
@@ -120,13 +125,39 @@ class EventsRepo:
         await self._db.conn.commit()
         return cursor.rowcount > 0
 
-    async def review(self, household_id: str, event_id: str, status: str, user_id: str) -> bool:
+    async def latency(self, household_id: str, event_id: str) -> dict | None:
+        """Pipeline timestamps stored on the event (epoch seconds, NULL if unmeasured)."""
+        row = await (await self._db.conn.execute(
+            "SELECT captured_at,detected_at,queued_at,first_sent_at,first_delivered_at,acknowledged_at "
+            "FROM events WHERE household_id=? AND event_id=?",
+            (household_id, event_id),
+        )).fetchone()
+        return dict(row) if row else None
+
+    async def household_event_ids(self, household_id: str, event_ids: list[str]) -> set[str]:
+        """The subset of `event_ids` that belong to the household."""
+        ids = sorted(set(event_ids))
+        if not ids:
+            return set()
+        placeholders = ",".join("?" for _ in ids)
+        rows = await (await self._db.conn.execute(
+            f"SELECT event_id FROM events WHERE household_id=? AND event_id IN ({placeholders})",
+            [household_id, *ids],
+        )).fetchall()
+        return {row["event_id"] for row in rows}
+
+    async def review(self, household_id: str, event_id: str, status: str, user_id: str,
+                     reason: str | None = None, note: str | None = None) -> bool:
         if status not in VALID_STATUSES:
             raise ValueError(f"invalid status {status!r}, must be one of {VALID_STATUSES}")
+        # Dismiss reason and note are kept only for a dismissal; any other status clears them.
+        dismissed = status == "dismissed"
         cursor = await self._db.conn.execute(
-            "UPDATE events SET status=?, reviewed_at=?, reviewed_by=? "
+            "UPDATE events SET status=?, reviewed_at=?, reviewed_by=?, dismiss_reason=?, dismiss_note=? "
             "WHERE household_id=? AND event_id=?",
-            (status, time.time(), user_id, household_id, event_id),
+            (status, time.time(), user_id,
+             reason if dismissed else None, note if dismissed else None,
+             household_id, event_id),
         )
         await self._db.conn.commit()
         return cursor.rowcount > 0
