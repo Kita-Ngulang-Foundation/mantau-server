@@ -48,7 +48,7 @@ logging.getLogger("aiosqlite").setLevel(logging.INFO)
 
 from .routes import (  # noqa: E402
     agents, cameras, contacts, control, detection, devices, events, frames, health, households,
-    inference, ingest, missed, recordings, usage,
+    inference, ingest, internal, missed, recordings, usage,
 )
 
 
@@ -227,6 +227,7 @@ def create_app(
     app.include_router(health.router)
     app.include_router(ingest.router)
     app.include_router(agents.router)
+    app.include_router(internal.router)
     app.include_router(control.router)
     app.include_router(households.router)
     app.include_router(cameras.router)
