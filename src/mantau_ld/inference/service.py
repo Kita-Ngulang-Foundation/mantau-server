@@ -436,7 +436,9 @@ class InferenceService:
     async def _close_session(self, session: _Session) -> None:
         async with session.lock:
             await self._close_detectors(session)
-        await self._write_minutes(self._take_minutes(session, include_open=True))
+        # In the background: an expired session closes on a new frame's path.
+        # close() gathers these, so shutdown still writes them.
+        self._spawn(self._write_minutes(self._take_minutes(session, include_open=True)))
 
     async def _flush_minutes(self, *, include_open: bool = False) -> None:
         rows: list[dict] = []

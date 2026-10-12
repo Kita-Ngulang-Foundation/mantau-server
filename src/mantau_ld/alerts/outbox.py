@@ -114,6 +114,7 @@ class PushOutbox:
     async def deliver_pending(self):
         if self.db.in_atomic:
             raise RuntimeError("Push delivery must follow the enclosing transaction commit")
+        delivered = []
         async with self.lock:
             async with self.db.serialized():
                 rows = await (await self.db.conn.execute(
@@ -166,12 +167,15 @@ class PushOutbox:
                         "UPDATE push_outbox SET state=?,next_attempt_at=?,last_error=? WHERE id=?",
                         (state, time.time()+min(300, 2 ** attempts), reason, row['id']))
                     await self.db.conn.commit()
-                # Telemetry comes after the product state is committed.
-                await self._persist_delivery(row, 'sent_at', 'first_sent_at', sent_at)
-                if delivered_at is not None:
-                    await self._persist_delivery(row, 'delivered_at', 'first_delivered_at', delivered_at)
-                if unregistered and self.telemetry is not None:
-                    await self._log_unregistered(row)
+                delivered.append((row, sent_at, delivered_at, unregistered))
+        # Telemetry only after every recipient of this batch had its push, so no
+        # family member's alert waits on a telemetry write.
+        for row, sent_at, delivered_at, unregistered in delivered:
+            await self._persist_delivery(row, 'sent_at', 'first_sent_at', sent_at)
+            if delivered_at is not None:
+                await self._persist_delivery(row, 'delivered_at', 'first_delivered_at', delivered_at)
+            if unregistered and self.telemetry is not None:
+                await self._log_unregistered(row)
 
     async def run(self):
         while True:
