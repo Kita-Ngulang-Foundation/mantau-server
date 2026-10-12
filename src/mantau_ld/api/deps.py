@@ -17,6 +17,7 @@ from ..store.db import Database
 from ..store.events_repo import EventsRepo
 from ..store.identity_repo import IdentityRepo
 from ..store.recipient_resolver import SqliteRecipientResolver
+from ..store.telemetry_repo import TelemetryRepo
 from ..store.token_store import SqliteTokenStore
 
 
@@ -66,3 +67,7 @@ def get_ack_service(request: Request) -> AckService:
 
 def get_frames(request: Request) -> FrameStore:
     return request.app.state.frames
+
+
+def get_telemetry_repo(request: Request) -> TelemetryRepo:
+    return request.app.state.telemetry_repo

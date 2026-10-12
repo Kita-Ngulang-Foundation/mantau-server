@@ -5,6 +5,12 @@ repo's config.py for why the prefix is never overridden per-subclass.
 
 from __future__ import annotations
 
+import importlib.metadata
+import json
+import os
+from functools import lru_cache
+from pathlib import Path
+
 from mantau_core.config import CoreSettings
 
 FIREBASE_JWKS_URL = (
@@ -14,6 +20,9 @@ FIREBASE_JWKS_URL = (
 
 class Settings(CoreSettings):
     db_path: str = "data/mantau_ld.db"
+    # Server build string for /health and telemetry. Empty falls back to
+    # RAILWAY_GIT_COMMIT_SHA, then "unknown".
+    build_id: str = ""
 
     # Users sign in with Firebase Authentication. Defaults to the project that
     # delivers push (MANTAU_FCM_PROJECT_ID), which is the same Firebase project.
@@ -96,3 +105,46 @@ def _is_fernet_key(value: str) -> bool:
     except (ValueError, UnicodeEncodeError, TypeError):
         return False
     return True
+
+
+def build_info(settings: Settings | None = None) -> dict:
+    """Which builds are running: server, mantau-core and mantau-AI. No secrets."""
+    server = (settings.build_id if settings is not None else "").strip()
+    server = (server or os.environ.get("MANTAU_BUILD_ID", "").strip()
+              or os.environ.get("RAILWAY_GIT_COMMIT_SHA", "").strip() or "unknown")
+    return {"server": server, "core": _core_build(), "ai": _ai_build()}
+
+
+@lru_cache(maxsize=1)
+def _core_build() -> str:
+    # The Dockerfile copies the repository root to /app, where the ref file sits.
+    try:
+        ref = (Path(__file__).resolve().parents[2] / "mantau-core.ref").read_text(encoding="utf-8")
+        return ref.strip() or "unknown"
+    except Exception:  # noqa: BLE001 -- a missing ref must not fail /health
+        return "unknown"
+
+
+@lru_cache(maxsize=1)
+def _ai_build() -> str:
+    try:
+        raw = importlib.metadata.distribution("mantau-prototype").read_text("direct_url.json")
+        return str(json.loads(raw)["vcs_info"]["commit_id"])
+    except Exception:  # noqa: BLE001 -- no git checkout: a local wheel has no vcs_info
+        pass
+    # The image installs the detector from a local wheel; the Dockerfile copies
+    # private-deps/SHA256SUMS next to the repo and checks it.
+    try:
+        sums = (Path(__file__).resolve().parents[2] / "private-deps" / "SHA256SUMS").read_text(encoding="utf-8")
+        for line in sums.splitlines():
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            name = Path(parts[-1]).name
+            digest = parts[0].lower()
+            if name.startswith("mantau_prototype-") and name.endswith(".whl") and all(
+                    c in "0123456789abcdef" for c in digest):
+                return "wheel-" + digest[:12]
+    except Exception:  # noqa: BLE001 -- unreadable sums must not fail /health
+        pass
+    return "unknown"

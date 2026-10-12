@@ -292,6 +292,83 @@ CREATE TABLE IF NOT EXISTS discovery_results (
 
 CREATE INDEX IF NOT EXISTS idx_commands_agent_state
 ON queued_commands(agent_id, state, created_at);
+
+-- v5: field-trial telemetry. Rows exist only for households in trial_cohort.
+CREATE TABLE IF NOT EXISTS heartbeat_log (
+    id                INTEGER PRIMARY KEY,
+    household_id      TEXT,
+    agent_id          TEXT,
+    camera_id         TEXT,
+    sent_at           REAL,
+    received_at       REAL,
+    camera_reachable  INTEGER,
+    detector_alive    INTEGER,
+    queue_depth       INTEGER,
+    agent_version     TEXT,
+    stats_json        TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_heartbeat_log_household ON heartbeat_log(household_id, sent_at);
+CREATE INDEX IF NOT EXISTS idx_heartbeat_log_agent ON heartbeat_log(agent_id, received_at);
+CREATE TABLE IF NOT EXISTS camera_minutes (
+    household_id          TEXT,
+    agent_id              TEXT,
+    camera_id             TEXT,
+    minute                REAL,
+    frames_received       INTEGER,
+    frames_processed      INTEGER,
+    rate_limited          INTEGER,
+    out_of_order          INTEGER,
+    undecodable           INTEGER,
+    confirmations         INTEGER,
+    server_ms_mean        REAL,
+    server_ms_max         REAL,
+    frames_people_0       INTEGER,
+    frames_people_1       INTEGER,
+    frames_people_multi   INTEGER,
+    cov_no_person_s       REAL,
+    cov_one_person_s      REAL,
+    cov_multi_person_s    REAL,
+    cov_low_confidence_s  REAL,
+    cov_outage_s          REAL,
+    events_emitted        INTEGER,
+    hidden_low_confidence INTEGER,
+    hidden_excluded       INTEGER,
+    capture_lag_ms_min    REAL,
+    server_build          TEXT,
+    config_hash           TEXT,
+    PRIMARY KEY(agent_id, camera_id, minute)
+);
+CREATE INDEX IF NOT EXISTS idx_camera_minutes_household ON camera_minutes(household_id, minute);
+CREATE TABLE IF NOT EXISTS missed_reports (
+    report_id      TEXT PRIMARY KEY,
+    household_id   TEXT NOT NULL,
+    source         TEXT NOT NULL,
+    reported_by    TEXT,
+    created_at     REAL NOT NULL,
+    occurred_from  REAL NOT NULL,
+    occurred_to    REAL NOT NULL,
+    kind           TEXT NOT NULL,
+    camera_id      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_missed_reports_household ON missed_reports(household_id, created_at);
+CREATE TABLE IF NOT EXISTS usage_events (
+    id           INTEGER PRIMARY KEY,
+    household_id TEXT,
+    user_id      TEXT,
+    type         TEXT,
+    at           REAL,
+    event_id     TEXT,
+    value        TEXT,
+    app_version  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_usage_events_household ON usage_events(household_id, at);
+CREATE TABLE IF NOT EXISTS trial_cohort (
+    household_id  TEXT PRIMARY KEY,
+    code          TEXT UNIQUE,
+    start_date    TEXT,
+    end_date      TEXT,
+    tz            TEXT
+);
 """
 
 
@@ -342,6 +419,13 @@ async def _migrate_existing(conn: aiosqlite.Connection) -> None:
     await _add_column(conn, "emergency_contacts", "household_id TEXT REFERENCES households(household_id)")
     await _add_column(conn, "queued_commands", "household_id TEXT REFERENCES households(household_id)")
     await _add_column(conn, "queued_commands", "requested_by_user_id TEXT REFERENCES users(user_id)")
+    # v5: field-trial telemetry (cohort households only; old rows stay NULL).
+    for column in ("captured_at REAL", "detected_at REAL", "queued_at REAL", "first_sent_at REAL",
+                   "first_delivered_at REAL", "candidate_at REAL", "confirmed_at REAL",
+                   "build_json TEXT", "dismiss_reason TEXT", "dismiss_note TEXT"):
+        await _add_column(conn, "events", column)
+    for column in ("sent_at REAL", "delivered_at REAL", "received_at REAL"):
+        await _add_column(conn, "push_outbox", column)
 
     agents = await (await conn.execute(
         "SELECT agent_id,enrolled_at FROM agents WHERE enrollment_id IS NULL OR enrollment_id=''"
@@ -417,6 +501,9 @@ async def _migrate_existing(conn: aiosqlite.Connection) -> None:
     )
     await conn.execute(
         "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(4,strftime('%s','now'))"
+    )
+    await conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(5,strftime('%s','now'))"
     )
 
 

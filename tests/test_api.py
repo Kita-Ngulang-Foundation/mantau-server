@@ -23,7 +23,7 @@ def _enroll_claim(client: TestClient, *, camera_id: str | None = None) -> dict:
 
 def test_health_and_ready_lists_missing_settings_by_name():
     with _client() as client:
-        assert client.get("/health").json() == {"status": "ok"}
+        assert client.get("/health").json()["status"] == "ok"
         ready = client.get("/ready")
         assert ready.status_code == 503
         assert ready.json()["missing"] == [
