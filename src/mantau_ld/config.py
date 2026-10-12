@@ -10,6 +10,7 @@ import json
 import os
 from functools import lru_cache
 from pathlib import Path
+from pydantic import SecretStr
 
 from mantau_core.config import CoreSettings
 
@@ -32,6 +33,8 @@ class Settings(CoreSettings):
     command_ttl_s: int = 300
     command_delivery_lease_s: int = 30
     agent_offline_after_s: int = 30
+    # Read-only fleet inventory, used only by the separate internal dashboard.
+    internal_agents_token: SecretStr = SecretStr("")
     # Single-use keys a household owner/admin creates in the app and enters on
     # a new agent. Only their SHA-256 is stored.
     enrollment_key_ttl_s: int = 3600
