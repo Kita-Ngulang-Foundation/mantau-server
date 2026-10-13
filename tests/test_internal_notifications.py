@@ -53,6 +53,7 @@ def test_actual_delivery_and_phone_receipt_are_distinct_outside_trial_cohort():
         assert delivery['sent_at'] is not None and delivery['fcm_accepted_at'] is not None
         assert delivery['received_at'] is None
         assert before['title'] and before['body']
+        assert before['message_source'] == 'saved_notification'
         assert 'private-fcm-token' not in response.text and enrolled['secret'] not in response.text
         received = time.time()
         item = {'type': 'notification_received', 'at': received, 'event_id': event.event_id, 'device_id': 'phone'}
@@ -98,6 +99,7 @@ def test_history_only_candidates_are_excluded_and_no_recipient_alarm_still_appea
         data = client.get('/internal/notifications', headers=ADMIN).json()
         assert [row['event_id'] for row in data['alarms']] == ['confirmed']
         assert data['alarms'][0]['deliveries'] == []
+        assert data['alarms'][0]['message_source'] == 'alarm_description'
         assert data['summary']['no_recipients'] == data['summary']['alarms'] == 1
 
 

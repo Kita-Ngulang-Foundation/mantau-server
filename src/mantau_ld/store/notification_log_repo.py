@@ -81,6 +81,7 @@ class NotificationLogRepo:
                         break
                 except (ValueError, TypeError, AttributeError):
                     continue
+            message_source = 'saved_notification' if title is not None else 'alarm_description'
             if title is None:
                 model = FallEvent(event_id=event['event_id'], camera_id=event['camera_id'],
                     kind=event['kind'], severity=event['severity'], occurred_at=event['occurred_at'],
@@ -92,7 +93,7 @@ class NotificationLogRepo:
                 'household_name': event['household_name'], 'camera_id': event['camera_id'],
                 'camera_name': event['camera_name'], 'agent_id': event['agent_id'],
                 'kind': event['kind'], 'severity': event['severity'], 'review_status': event['status'],
-                'title': title, 'body': body,
+                'title': title, 'body': body, 'message_source': message_source,
                 'deliveries': [{
                     'user_id': row['user_id'], 'recipient_name': row['recipient_name'],
                     'device_id': row['device_id'], 'state': row['state'], 'attempts': row['attempts'],
