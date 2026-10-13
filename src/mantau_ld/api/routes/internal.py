@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import hmac
 import time
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 
 from ...store.control_repo import ControlRepo
-from ..deps import get_control_repo
+from ...store.db import Database
+from ...store.notification_log_repo import NotificationLogRepo
+from ..deps import get_control_repo, get_db
 
 router = APIRouter(prefix="/internal", tags=["internal"])
 
@@ -45,3 +47,18 @@ async def fleet(request: Request, response: Response,
         })
     return {"generated_at": now, "offline_after_s": cutoff,
             "frame_stale_after_s": frame_cutoff, "agents": agents}
+
+
+@router.get("/notifications", dependencies=[Depends(internal_inventory_access)])
+async def notifications(request: Request, response: Response,
+                        days: int = Query(7, ge=1, le=30), limit: int = Query(100, ge=1, le=200),
+                        cursor: str | None = Query(None, max_length=1024),
+                        db: Database = Depends(get_db)) -> dict:
+    response.headers['Cache-Control'] = 'private, no-store'
+    now = time.time()
+    try:
+        data = await NotificationLogRepo(db).list(cutoff=now - days * 86400, limit=limit, cursor=cursor)
+    except ValueError:
+        raise HTTPException(422, 'invalid_notification_cursor') from None
+    return {'generated_at': now, 'days': days,
+            'retention_days': request.app.state.settings.event_retention_days, **data}

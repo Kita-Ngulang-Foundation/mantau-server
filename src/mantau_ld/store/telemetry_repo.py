@@ -1,5 +1,8 @@
-"""Field-trial telemetry. Rows exist only for households in `trial_cohort`
+"""Field-trial telemetry. Trial rows exist only for households in `trial_cohort`
 while today (in the cohort's own timezone) is inside its dates.
+
+Operational phone receipts update existing notification delivery rows for all
+households. They contain only identifiers and a timestamp, without media.
 
 Every write is best effort: a failed write is logged by exception type and
 dropped. Nothing here may fail or delay an event insert, a push, a heartbeat
@@ -233,8 +236,6 @@ class TelemetryRepo:
     @_best_effort(None)
     async def mark_received(self, household_id: str, user_id: str, device_id: str,
                             event_id: str, at: float) -> None:
-        if not await self.in_cohort(household_id):
-            return
         await self._write([(
             "UPDATE push_outbox SET received_at=? WHERE event_id=? AND device_id=? AND user_id=? "
             "AND household_id=? AND received_at IS NULL",
