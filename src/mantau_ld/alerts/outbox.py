@@ -164,8 +164,10 @@ class PushOutbox:
                     state = 'failed'
                 async with self.db.serialized():
                     await self.db.conn.execute(
-                        "UPDATE push_outbox SET state=?,next_attempt_at=?,last_error=? WHERE id=?",
-                        (state, time.time()+min(300, 2 ** attempts), reason, row['id']))
+                        "UPDATE push_outbox SET state=?,next_attempt_at=?,last_error=?,"
+                        "sent_at=COALESCE(sent_at,?),delivered_at=COALESCE(delivered_at,?) WHERE id=?",
+                        (state, time.time()+min(300, 2 ** attempts), reason,
+                         sent_at, delivered_at, row['id']))
                     await self.db.conn.commit()
                 delivered.append((row, sent_at, delivered_at, unregistered))
         # Telemetry only after every recipient of this batch had its push, so no
